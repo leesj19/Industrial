@@ -10,6 +10,7 @@ public class TunnelController : MonoBehaviour
     [Header("Graph Node Id")]
     [Tooltip("FactoryEnvManager에서 쓰는 노드 번호 (Spawner와 연속되게 부여)")]
     public int nodeId = -1;
+
     [Header("Graph Next Nodes (for FactoryEnvManager)")]
     [Tooltip("그래프/경로 계산용으로, 이 터널 다음에 갈 수 있는 터널들 (Spawner의 firstTunnels처럼 수동 지정)")]
     public TunnelController[] nextTunnelsForGraph;
@@ -175,11 +176,11 @@ public class TunnelController : MonoBehaviour
         if (blinkCo != null) StopCoroutine(blinkCo);
         if (instMat != null)
         {
-    #if UNITY_EDITOR
+#if UNITY_EDITOR
             DestroyImmediate(instMat);
-    #else
+#else
             Destroy(instMat);
-    #endif
+#endif
         }
     }
 
@@ -599,15 +600,10 @@ public class TunnelController : MonoBehaviour
         int predicted = GetPredictedQueueLoad(); // Q + R
         float ratio   = queue.Capacity > 0 ? (float)predicted / queue.Capacity : 0f;
 
-        // 자식 모두 막힘
+        // *** 수정 포인트: 자식 모두 막히면 ratio 상관없이 무조건 HOLD ***
         if (blocked == active)
         {
-            // 큐가 이미 꽉 찼으면 HOLD, 아니면 HALF_HOLD
-            if (ratio >= 1f)
-                EnterHold();
-            else if (ratio >= halfHoldRatioThreshold)
-                EnterHalfHold();
-
+            EnterHold();
             return;
         }
 
