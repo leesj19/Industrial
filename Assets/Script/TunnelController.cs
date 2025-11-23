@@ -15,6 +15,14 @@ public class TunnelController : MonoBehaviour
     [Tooltip("그래프/경로 계산용으로, 이 터널 다음에 갈 수 있는 터널들 (Spawner의 firstTunnels처럼 수동 지정)")]
     public TunnelController[] nextTunnelsForGraph;
 
+    // ===== Sink / Throughput (for RL) =====
+    [Header("Sink / Throughput (for RL)")]
+    [Tooltip("이 터널이 최종 배출 지점(라인 끝)인지 여부 (PL(T) 계산용)")]
+    public bool isSink = false;
+
+    [Tooltip("이 터널에서 지금까지 배출된 제품 개수 (RL throughput 계산용)")]
+    public int totalExitedCount = 0;
+
     // ===== 4-State =====
     // RUN : 정상
     // HALF_HOLD : 일부 downstream만 막힌 상태(부분 정체)
@@ -83,6 +91,7 @@ public class TunnelController : MonoBehaviour
     public Transform afterTunnelPoint;
 
     [Header("Auto Repair (Fixed Delay, Test)")]
+    [Tooltip("체크 시 FAULT 진입 후 fixedRepairDelay 초 뒤 자동 수리, 해제 시 자동 수리 없음")]
     public bool autoRepairFixedDelay = true;
     public float fixedRepairDelay = 15f;
     public KeyCode debugRepairKey = KeyCode.R;
@@ -235,7 +244,13 @@ public class TunnelController : MonoBehaviour
                         Debug.Log(Format($"{tag} HOLD 전파 → Q={current}, R={incoming}, Total={predicted} / Capacity={queue.Capacity}"));
                     }
 
-                    EnterHold();
+                    // HALF_HOLD 상태에서는 자기 상태를 HOLD로 올리지 않고,
+                    // 상류(자식/스포너)에게만 HOLD를 전파.
+                    if (!IsHalfHold)
+                    {
+                        EnterHold();
+                    }
+
                     NotifyChildrenHold();
                     holdSent = true;
                 }
@@ -343,8 +358,16 @@ public class TunnelController : MonoBehaviour
             if (!follower) continue;
 
             follower.ReleaseAllReservations();
+
+            // 실제 위치 이동
             if (afterTunnelPoint != null)
                 follower.transform.SetPositionAndRotation(afterTunnelPoint.position, afterTunnelPoint.rotation);
+
+            // ★ sink라면 여기서 throughput 카운트 증가
+            if (isSink)
+            {
+                totalExitedCount++;
+            }
 
             follower.enabled = true;
             follower.Resume();
@@ -374,8 +397,16 @@ public class TunnelController : MonoBehaviour
     // ===== 실패 / 수리 =====
     public void ForceFail() => SetFailed(true);
 
+    /// <summary>
+    /// 외부(로봇, 디버그 키 등)에서 강제로 수리할 때 사용.
+    /// 자동 수리 코루틴이 돌고 있으면 멈추고, FAULT 상태를 해제한다.
+    /// </summary>
     public void ForceRepair()
     {
+        // 이미 고장 상태가 아니면 아무 것도 안 함
+        if (!IsFault && !isFailed)
+            return;
+
         if (repairCo != null)
         {
             StopCoroutine(repairCo);
@@ -488,6 +519,7 @@ public class TunnelController : MonoBehaviour
 
         SetState(TunnelState.FAULT);
 
+        // ★ 체크되어 있을 때만 자동 수리 코루틴 동작
         if (autoRepairFixedDelay)
         {
             if (repairCo != null)
@@ -528,9 +560,12 @@ public class TunnelController : MonoBehaviour
 
         if (obeyUpstreamHold)
         {
-            // 나도 HOLD로 들어가고, spawn 포함 자식들에게 그대로 전파
+            // 상류에서 HOLD가 들어오면 나만 HOLD로 전환.
+            // 내 큐(Q+R)가 꽉 차는 순간에만 Update() 내 Q+R 로직이
+            // 다시 NotifyChildrenHold()를 호출해서 그 다음 상류를 HOLD로 만든다.
+            // (계단식 back-pressure)
             EnterHold();
-            NotifyChildrenHold();
+            // 여기서 더 이상 NotifyChildrenHold()를 바로 호출하지 않는다.
         }
     }
 
@@ -600,25 +635,17 @@ public class TunnelController : MonoBehaviour
         int predicted = GetPredictedQueueLoad(); // Q + R
         float ratio   = queue.Capacity > 0 ? (float)predicted / queue.Capacity : 0f;
 
-        // *** 수정 포인트: 자식 모두 막히면 ratio 상관없이 무조건 HOLD ***
+        // 자식 모두 막히면 ratio 상관없이 무조건 HOLD
         if (blocked == active)
         {
             EnterHold();
             return;
         }
 
-        // 일부만 막힘, 일부는 살아있음 → HALF_HOLD / HOLD
+        // ⚙️ 일부만 막힘, 일부는 살아있음 → 항상 HALF_HOLD (ratio와 무관)
         if (blocked > 0 && available > 0)
         {
-            if (ratio >= 1f)
-            {
-                EnterHold();
-            }
-            else if (ratio >= halfHoldRatioThreshold)
-            {
-                EnterHalfHold();
-            }
-
+            EnterHalfHold();
             return;
         }
 

@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using UnityEngine;
+using System;
 
 [RequireComponent(typeof(Rigidbody))]
 public class AStarAgent : MonoBehaviour
@@ -15,21 +16,17 @@ public class AStarAgent : MonoBehaviour
     int pathIndex = 0;
     bool hasPath = false;
 
-    // 이동 기반은 FixedUpdate로
+    public Action OnPathFinished;
+    public bool IsMoving => hasPath;
+
     void Awake()
     {
         rb = GetComponent<Rigidbody>();
         rb.interpolation = RigidbodyInterpolation.Interpolate;
     }
 
-    void Start()
-    {
-        RecalculatePath();
-    }
-
     void Update()
     {
-        // 타깃 바뀌면 path 갱신
         if (Input.GetKeyDown(KeyCode.Space))
             RecalculatePath();
     }
@@ -44,45 +41,97 @@ public class AStarAgent : MonoBehaviour
     {
         if (grid == null || target == null)
         {
-            Debug.LogWarning("Grid or Target not assigned.");
+            hasPath = false;
+            path = null;
+            pathIndex = 0;
             return;
         }
 
         path = grid.GetPath(transform.position, target.position);
+        if (path == null || path.Count == 0)
+        {
+            hasPath = false;
+            pathIndex = 0;
+            return;
+        }
+
         pathIndex = 0;
-        hasPath = (path != null && path.Count > 0);
+        hasPath = true;
+    }
+
+    public void SetTarget(Transform newTarget, bool recalcPath = true)
+    {
+        if (newTarget == null)
+            return;
+
+        target = newTarget;
+
+        if (recalcPath)
+            RecalculatePath();
+    }
+
+    public void ClearPath()
+    {
+        hasPath = false;
+        path = null;
+        pathIndex = 0;
     }
 
     void FollowPath()
     {
-        if (!hasPath || pathIndex >= path.Count)
+        if (!hasPath || path == null || pathIndex >= path.Count)
             return;
 
-        Vector3 targetPos = path[pathIndex];
-        targetPos.y = transform.position.y;
+        Vector3 nodePos = path[pathIndex];
+        nodePos.y = transform.position.y;
 
-        Vector3 dir = targetPos - transform.position;
-        float dist = dir.magnitude;
+        Vector3 toNode = nodePos - transform.position;
+        float distToNode = toNode.magnitude;
 
-        if (dist < stoppingDistance)
+        float step = moveSpeed * Time.fixedDeltaTime;
+
+        float arriveThreshold = Mathf.Max(stoppingDistance, step * 0.5f);
+        if (distToNode <= arriveThreshold)
         {
+            rb.MovePosition(nodePos);
             pathIndex++;
+
+            if (pathIndex >= path.Count)
+            {
+                hasPath = false;
+
+                float distToTarget = target != null
+                    ? Vector3.Distance(transform.position, new Vector3(target.position.x, transform.position.y, target.position.z))
+                    : 0f;
+
+                if (target != null && distToTarget > stoppingDistance * 2f)
+                {
+                    RecalculatePath();
+
+                    if (!hasPath)
+                        OnPathFinished?.Invoke();
+                }
+                else
+                {
+                    OnPathFinished?.Invoke();
+                }
+            }
+
             return;
         }
 
-        dir.Normalize();
-
-        // Rigidbody 이동
-        Vector3 newPos =
-            transform.position + dir * moveSpeed * Time.fixedDeltaTime;
+        Vector3 dir = toNode / distToNode;
+        float moveDist = Mathf.Min(step, distToNode);
+        Vector3 newPos = transform.position + dir * moveDist;
         rb.MovePosition(newPos);
 
-        // 부드러운 회전
         if (dir != Vector3.zero)
         {
             Quaternion targetRot = Quaternion.LookRotation(dir);
             transform.rotation = Quaternion.RotateTowards(
-                transform.rotation, targetRot, 180f * Time.fixedDeltaTime);
+                transform.rotation,
+                targetRot,
+                180f * Time.fixedDeltaTime);
         }
     }
 }

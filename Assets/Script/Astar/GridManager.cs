@@ -27,6 +27,14 @@ public class GridManager : MonoBehaviour
 
     [HideInInspector] public List<Node> debugPath;
 
+    // === 디버그 그리드/경로 표시 토글 ===
+    [Header("Debug View")]
+    [Tooltip("씬/게임 뷰에 그리드 & 경로 Gizmo를 표시할지 여부")]
+    public bool showDebugGizmos = true;
+
+    [Tooltip("플레이 중 이 키를 눌러 디버그 뷰를 토글 (예: G)")]
+    public KeyCode toggleDebugKey = KeyCode.G;
+
     void Awake()
     {
         // === 여기서 2배 촘촘하게 만듦 ===
@@ -37,6 +45,24 @@ public class GridManager : MonoBehaviour
         gridSizeX = Mathf.RoundToInt(gridWorldSize.x / nodeDiameter);
         gridSizeY = Mathf.RoundToInt(gridWorldSize.y / nodeDiameter);
         CreateGrid();
+    }
+
+    void Update()
+    {
+        // 플레이 중 키로 토글
+        if (Input.GetKeyDown(toggleDebugKey))
+        {
+            showDebugGizmos = !showDebugGizmos;
+        }
+    }
+
+    /// <summary>
+    /// UI 버튼에서 호출할 수 있는 디버그 토글 함수
+    /// (Button OnClick에 GridManager를 드래그한 후 이 함수 선택)
+    /// </summary>
+    public void ToggleDebugGizmos()
+    {
+        showDebugGizmos = !showDebugGizmos;
     }
 
     void CreateGrid()
@@ -201,6 +227,10 @@ public class GridManager : MonoBehaviour
 #if UNITY_EDITOR
     void OnDrawGizmos()
     {
+        // 🔹 디버그 뷰 꺼져 있으면 아무것도 그리지 않음
+        if (!showDebugGizmos)
+            return;
+
         Gizmos.color = Color.gray;
         Gizmos.DrawWireCube(
             transform.position,
