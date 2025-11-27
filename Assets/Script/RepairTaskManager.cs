@@ -1,6 +1,9 @@
 using UnityEngine;
 using System.Collections;
 using System.Collections.Generic;
+using System;
+
+using Random = UnityEngine.Random;
 
 public class RepairTaskManager : MonoBehaviour
 {
@@ -9,16 +12,30 @@ public class RepairTaskManager : MonoBehaviour
     public List<RepairSite> sites;    // 씬에서 등록할 RepairSite 목록
 
     [Header("DQN Agent (optional)")]
-    [Tooltip("DQN 학습용 transition을 만들기 위한 에이전트 (없으면 DQN 연동 안 함)")]
+    [Tooltip("DQN 학습용 transition + 액션 선택을 위한 에이전트 (없으면 DQN 연동 안 함)")]
     public DqnAgent dqnAgent;
 
-    [Header("선택 정책")]
+    [Header("기본 선택 정책 (DQN 실패 시 사용)")]
     [Tooltip("여러 고장 사이트가 있을 때 무작위로 선택할지 여부 (false면 리스트 순서대로)")]
     public bool chooseRandomWhenMultiple = true;
 
     [Header("수리 설정")]
     [Tooltip("수리 구역 도착 후 실제 수리에 걸리는 시간(초)")]
     public float repairDuration = 5f;
+
+    [Header("DQN 액션 선택 설정")]
+    [Tooltip("true면 가능한 경우 DQN으로 다음 수리 대상 선택")]
+    public bool useDqnSelection = true;
+
+    [Range(0f, 1f)]
+    [Tooltip("ε-greedy 탐색 비율 (Python 쪽으로 전달)")]
+    public float epsilon = 0.3f;
+
+    [Tooltip("ε 최소값")]
+    public float epsilonMin = 0.05f;
+
+    [Tooltip("수리 한 번 끝날 때마다 ε *= epsilonDecay")]
+    public float epsilonDecay = 0.999f;
 
     RepairSite currentTarget;
     readonly List<RepairSite> pendingSites = new List<RepairSite>();
@@ -73,12 +90,114 @@ public class RepairTaskManager : MonoBehaviour
     }
 
     /// <summary>
-    /// 로봇이 비어 있고, pendingSites에 수리할 곳이 있으면 하나 골라서 이동 명령.
+    /// 로봇이 비어 있고, pendingSites에 수리할 곳이 있으면
+    /// DQN으로 한 곳을 선택하거나 (가능하다면),
+    /// 실패 시 기본 랜덤/순차 정책으로 하나 골라서 이동 명령.
     /// </summary>
     void TryAssignNextTask()
     {
         if (robotBusy) return;
         if (pendingSites.Count == 0) return;
+
+        bool canUseDqn =
+            useDqnSelection &&
+            dqnAgent != null &&
+            dqnAgent.tcpClient != null &&
+            dqnAgent.tcpClient.IsConnected;
+
+        if (canUseDqn)
+        {
+            // ---- DQN 후보 nodeId 리스트 구성 ----
+            List<int> candidateNodeIds = new List<int>();
+            foreach (var s in pendingSites)
+            {
+                if (s != null && s.tunnel != null)
+                {
+                    candidateNodeIds.Add(s.tunnel.nodeId);
+                }
+            }
+
+            if (candidateNodeIds.Count == 0)
+            {
+                // 안전 장치: 터널 없는 사이트들이라면 그냥 기본 정책으로
+                if (dqnAgent.debugLogs)
+                    Debug.LogWarning("[RepairTaskManager] DQN candidateNodeIds 비어있음 → 기본 정책 사용");
+                PickAndAssignLocalPolicy();
+                return;
+            }
+
+            // 두 번 배정되는 것 방지
+            robotBusy = true;
+
+            if (dqnAgent.debugLogs)
+            {
+                Debug.Log($"[RepairTaskManager] DQN 액션 요청: candidates=[{string.Join(",", candidateNodeIds)}], eps={epsilon:F3}");
+            }
+
+            // DQN 에게 액션 요청 (코루틴)
+            StartCoroutine(dqnAgent.CoRequestActionAndPickNode(
+                candidateNodeIds,
+                epsilon,
+                (chosenNodeId, success) =>
+                {
+                    // 이 콜백은 메인 스레드에서 실행됨
+
+                    if (!success)
+                    {
+                        if (dqnAgent.debugLogs)
+                            Debug.LogWarning("[RepairTaskManager] DQN 액션 선택 실패 → 기본 정책으로 fallback");
+                        robotBusy = false;
+                        PickAndAssignLocalPolicy();
+                        return;
+                    }
+
+                    // ε decay
+                    epsilon = Mathf.Max(epsilonMin, epsilon * epsilonDecay);
+
+                    // chosenNodeId에 대응하는 RepairSite 찾기
+                    currentTarget = null;
+                    for (int i = 0; i < pendingSites.Count; i++)
+                    {
+                        var s = pendingSites[i];
+                        if (s != null && s.tunnel != null && s.tunnel.nodeId == chosenNodeId)
+                        {
+                            currentTarget = s;
+                            pendingSites.RemoveAt(i);
+                            break;
+                        }
+                    }
+
+                    if (currentTarget == null)
+                    {
+                        if (dqnAgent.debugLogs)
+                            Debug.LogWarning($"[RepairTaskManager] chosenNodeId={chosenNodeId} 에 해당하는 pending site 없음 → 기본 정책 fallback");
+                        robotBusy = false;
+                        PickAndAssignLocalPolicy();
+                        return;
+                    }
+
+                    // 로봇 이동 시작
+                    robot.SetTarget(currentTarget.RepairPoint, true);
+                    robotBusy = true; // 이미 true 이지만 의미 명확히
+                }));
+        }
+        else
+        {
+            // DQN 사용 불가 → 기존 정책
+            PickAndAssignLocalPolicy();
+        }
+    }
+
+    /// <summary>
+    /// DQN을 쓰지 못할 때 사용하는 기존 랜덤/순차 정책.
+    /// </summary>
+    void PickAndAssignLocalPolicy()
+    {
+        if (pendingSites.Count == 0)
+        {
+            robotBusy = false;
+            return;
+        }
 
         int idx = 0;
         if (chooseRandomWhenMultiple && pendingSites.Count > 1)
@@ -95,16 +214,18 @@ public class RepairTaskManager : MonoBehaviour
             return;
         }
 
-        // ==== DQN 연동: 액션 선택 직후 상태 s_t 기록 ====
-        if (dqnAgent != null && currentTarget.tunnel != null)
+        if (dqnAgent != null && dqnAgent.debugLogs)
         {
-            int nodeId = currentTarget.tunnel.nodeId;
-            int actionId = nodeId;   // 일단 nodeId를 그대로 액션 ID처럼 사용 (추후 바꿔도 됨)
-
-            dqnAgent.RecordAction(actionId, nodeId);
+            if (currentTarget.tunnel != null)
+            {
+                Debug.Log($"[RepairTaskManager] Local policy로 nodeId={currentTarget.tunnel.nodeId} 선택");
+            }
+            else
+            {
+                Debug.Log("[RepairTaskManager] Local policy 선택 (tunnel null)");
+            }
         }
 
-        // 로봇의 목표를 이 RepairSite의 RepairPoint로 설정
         robot.SetTarget(currentTarget.RepairPoint, true);
         robotBusy = true;
     }
@@ -136,6 +257,14 @@ public class RepairTaskManager : MonoBehaviour
 
         if (site != null)
         {
+            // ==== DQN 연동: "수리 시작 시점"에서 s_t 기록 ====
+            if (dqnAgent != null && site.tunnel != null)
+            {
+                int nodeId = site.tunnel.nodeId;
+                int actionId = nodeId;   // 현재는 nodeId를 액션 ID처럼 사용
+                dqnAgent.RecordAction(actionId, nodeId);
+            }
+
             site.BeginRepairVisual();
         }
 
@@ -157,9 +286,11 @@ public class RepairTaskManager : MonoBehaviour
         {
             site.OnRepaired();
             site.EndRepairVisual();
+            // 다시 고장났을 때 큐에 재등록될 수 있도록 플래그 리셋
+            site.isQueued = false;
         }
 
-        // ==== DQN 연동: 한 스텝(수리) 종료 시점에 s_{t+1}, reward 계산 ====
+        // ==== DQN 연동: "수리 끝난 직후"에 한 스텝 종료 처리 ====
         if (dqnAgent != null)
         {
             dqnAgent.FinishStepAndSend();

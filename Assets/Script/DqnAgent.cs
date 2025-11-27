@@ -61,6 +61,15 @@ public class DqnAgent : MonoBehaviour
     // 디버그용 transition 카운터
     int transitionStepCounter = 0;
 
+    // ===== Action 선택용 상태 (action_request / action_reply) =====
+    bool waitingActionReply = false;   // Python 쪽 action_reply를 기다리는 중인지
+    bool hasLastActionReply = false;   // 마지막 action_reply 수신 여부
+    int lastChosenNodeId = -1;         // Python이 선택해준 node_id
+    int[] lastCandidateNodeIds = null; // Python에서 echo된 후보 node_id들
+    float[] lastQValues = null;        // 후보별 Q(s,a)
+    float lastEpsilon = 0f;            // 사용된 epsilon
+    bool lastIsRandom = false;         // epsilon 랜덤 선택 여부
+
     // Python 쪽으로 보낼 JSON 구조와 동일한 형태
     [Serializable]
     public class TransitionMessage
@@ -73,11 +82,37 @@ public class DqnAgent : MonoBehaviour
         public float[] state_tp1;
     }
 
+    /// <summary>
+    /// action_request용 DTO
+    /// </summary>
+    [Serializable]
+    public class ActionRequestMessage
+    {
+        public string type = "action_request";
+        public float[] state;
+        public int[] candidate_node_ids;
+        public float epsilon;
+    }
+
     void Awake()
     {
         if (factoryEnv == null)
         {
             factoryEnv = FactoryEnvManager.Instance; // FactoryEnvManager.Singleton 사용
+        }
+
+        // TCP 클라이언트가 있으면 Python의 action_reply를 구독
+        if (tcpClient != null)
+        {
+            tcpClient.OnActionReply += HandleActionReplyFromPython;
+        }
+    }
+
+    void OnDestroy()
+    {
+        if (tcpClient != null)
+        {
+            tcpClient.OnActionReply -= HandleActionReplyFromPython;
         }
     }
 
@@ -140,37 +175,51 @@ public class DqnAgent : MonoBehaviour
     ///   s_{t+1} 상태를 읽어 transition을 완성한다.
     /// (실제 호출 위치는 RepairTaskManager.CoRepairCurrentTarget 끝부분)
     /// </summary>
-    public void FinishStepAndSend()
+public void FinishStepAndSend()
+{
+    // 아직 RecordAction이 안 된 상태면 할 일 없음
+    if (!hasPendingTransition)
+        return;
+
+    if (factoryEnv == null)
     {
-        if (!hasPendingTransition)
-            return;
-
-        if (factoryEnv == null)
-        {
-            Debug.LogError("[DqnAgent] FactoryEnvManager 참조가 없습니다.");
-            return;
-        }
-
-        // 관찰 윈도우를 사용하는 경우: 여기서 시작 신호
-        if (factoryEnv.useObservationWindow)
-        {
-            factoryEnv.BeginRewardObservation();
-            if (debugLogs)
-            {
-                Debug.Log($"[DqnAgent] BeginRewardObservation() 호출 - window T={factoryEnv.observationWindow:F2}s");
-            }
-        }
-
-        // 실제 전송은 코루틴에서 window T만큼 지난 뒤 수행
-        StartCoroutine(CoWaitWindowAndSend());
+        Debug.LogError("[DqnAgent] FactoryEnvManager 참조가 없습니다.");
+        return;
     }
+
+    // --- 이 step 전용으로 값 복사 ---
+    int actionId = lastActionId;
+    int nodeId = lastNodeId;
+    float[] state_t = lastState;
+
+    // 이 시점부터는 "다음 액션"을 막지 않도록 플래그 해제
+    hasPendingTransition = false;
+
+    // 관찰 윈도우 사용하는 경우: 여기서 시작 신호
+    if (factoryEnv.useObservationWindow)
+    {
+        factoryEnv.BeginRewardObservation();
+        if (debugLogs)
+        {
+            Debug.Log(
+                $"[DqnAgent] BeginRewardObservation() 호출 - window T={factoryEnv.observationWindow:F2}s " +
+                $"(actionId={actionId}, nodeId={nodeId})"
+            );
+        }
+    }
+
+    // 복사해둔 값들을 코루틴에 넘겨줌
+    StartCoroutine(CoWaitWindowAndSend(actionId, nodeId, state_t));
+}
+
 
     /// <summary>
     /// 관찰 윈도우 T초를 기다린 뒤,
     /// FactoryEnvManager가 계산한 윈도우 리워드를 읽고
     /// s_{t+1}을 스냅샷해서 transition을 생성/전송한다.
+    /// (각 step마다 actionId/nodeId/state_t 복사본을 들고 있음)
     /// </summary>
-    IEnumerator CoWaitWindowAndSend()
+    IEnumerator CoWaitWindowAndSend(int actionId, int nodeId, float[] state_t)
     {
         float waitT = 0f;
 
@@ -213,10 +262,10 @@ public class DqnAgent : MonoBehaviour
 
         var msg = new TransitionMessage
         {
-            action_id = lastActionId,
-            node_id = lastNodeId,
+            action_id = actionId,
+            node_id = nodeId,
             reward = reward,
-            state_t = lastState,
+            state_t = state_t,
             state_tp1 = nextState
         };
 
@@ -226,15 +275,16 @@ public class DqnAgent : MonoBehaviour
         {
             Debug.Log(
                 $"[DqnAgent] FinishStepAndSend(step={transitionStepCounter}) " +
-                $"actionId={lastActionId}, nodeId={lastNodeId}, reward={reward:F3}"
+                $"actionId={actionId}, nodeId={nodeId}, reward={reward:F3}"
             );
             Debug.Log(
-                $"[DqnAgent] state_t_dim={lastState?.Length ?? 0}, " +
+                $"[DqnAgent] state_t_dim={state_t?.Length ?? 0}, " +
                 $"state_tp1_dim={nextState?.Length ?? 0}"
             );
 
             if (logStateVector)
             {
+                DebugLogState("s_t", state_t);
                 DebugLogState("s_tp1", nextState);
             }
 
@@ -256,8 +306,143 @@ public class DqnAgent : MonoBehaviour
                 Debug.LogError($"[DqnAgent] TCP 전송 중 예외 발생: {e}");
             }
         }
+    }
 
-        hasPendingTransition = false;
+
+    // =========================
+    //   액션 선택용: action_request / action_reply
+    // =========================
+
+    /// <summary>
+    /// Python에서 "action_reply"를 받았을 때 DqnTcpClient가 호출해줄 콜백.
+    /// </summary>
+    void HandleActionReplyFromPython(
+        int chosenNodeId,
+        int[] candidateNodeIds,
+        float[] qValues,
+        float epsilon,
+        bool isRandom
+    )
+    {
+        if (!waitingActionReply)
+        {
+            // 지금은 안 기다리고 있는데 action_reply가 오면 참고용 로그만
+            if (debugLogs)
+            {
+                Debug.Log($"[DqnAgent] (late) action_reply 수신: chosen={chosenNodeId}, eps={epsilon}, random={isRandom}");
+            }
+            return;
+        }
+
+        lastChosenNodeId     = chosenNodeId;
+        lastCandidateNodeIds = candidateNodeIds;
+        lastQValues          = qValues;
+        lastEpsilon          = epsilon;
+        lastIsRandom         = isRandom;
+
+        hasLastActionReply = true;
+        waitingActionReply = false;
+
+        if (debugLogs)
+        {
+            Debug.Log($"[DqnAgent] action_reply 수신: chosen={chosenNodeId}, eps={epsilon}, random={isRandom}");
+        }
+    }
+
+    /// <summary>
+    /// DQN 서버에 action_request를 보내고,
+    /// action_reply를 기다린 뒤 최종 chosen_node_id를 콜백으로 넘겨주는 코루틴.
+    ///
+    /// - candidates: 후보 nodeId 목록
+    /// - epsilon: epsilon-greedy 파라미터
+    /// - onDone: (chosenNodeId, isRandomFromEps) 콜백
+    /// </summary>
+    public IEnumerator CoRequestActionAndPickNode(
+        List<int> candidates,
+        float epsilon,
+        Action<int, bool> onDone
+    )
+    {
+        // TCP 사용 불가하면 그냥 랜덤/첫 번째로 fallback
+        if (tcpClient == null)
+        {
+            int fallbackNodeId = (candidates != null && candidates.Count > 0)
+                ? candidates[UnityEngine.Random.Range(0, candidates.Count)]
+                : -1;
+
+            if (debugLogs)
+            {
+                Debug.Log($"[DqnAgent] TCP 미사용 → fallback action nodeId={fallbackNodeId}");
+            }
+
+            onDone?.Invoke(fallbackNodeId, true);
+            yield break;
+        }
+
+        if (candidates == null || candidates.Count == 0)
+        {
+            if (debugLogs)
+                Debug.LogWarning("[DqnAgent] CoRequestActionAndPickNode: 후보가 없음");
+            onDone?.Invoke(-1, true);
+            yield break;
+        }
+
+        // === 현재 상태 벡터(s_t')를 Python 쪽 Q 계산용으로 보냄 ===
+        float[] stateVec = BuildStateVector();
+
+        // JSON payload 구성 (JsonUtility 사용 가능하도록 DTO 사용)
+        ActionRequestMessage req = new ActionRequestMessage
+        {
+            state = stateVec,
+            candidate_node_ids = candidates.ToArray(),
+            epsilon = epsilon
+        };
+
+        string json = JsonUtility.ToJson(req);
+
+        if (debugLogs)
+        {
+            Debug.Log($"[DqnAgent] action_request 전송: candidates=[{string.Join(",", candidates)}], eps={epsilon:F3}");
+        }
+
+        waitingActionReply = true;
+        hasLastActionReply = false;
+
+        // Python으로 전송
+        tcpClient.SendJsonLine(json);
+
+        // ==== action_reply 올 때까지 기다리기 ====
+        float timeout = 2.0f; // 2초 타임아웃 (원하면 Inspector로 빼도 됨)
+        float startTime = Time.time;
+
+        while (waitingActionReply && (Time.time - startTime) < timeout)
+        {
+            // 한 프레임씩 대기
+            yield return null;
+        }
+
+        if (!hasLastActionReply)
+        {
+            // 타임아웃 등으로 실패 → fallback
+            int fallbackNodeId = candidates[UnityEngine.Random.Range(0, candidates.Count)];
+            if (debugLogs)
+            {
+                Debug.LogWarning($"[DqnAgent] action_reply 타임아웃 → fallback nodeId={fallbackNodeId}");
+            }
+            onDone?.Invoke(fallbackNodeId, true);
+            yield break;
+        }
+
+        // === 정상적으로 action_reply를 받은 경우 ===
+        int chosen = lastChosenNodeId;
+        bool isRandom = lastIsRandom;
+
+        if (debugLogs)
+        {
+            Debug.Log($"[DqnAgent] 최종 선택 nodeId={chosen}, epsRandom={isRandom}");
+        }
+
+        onDone?.Invoke(chosen, isRandom);
     }
 
     // =========================

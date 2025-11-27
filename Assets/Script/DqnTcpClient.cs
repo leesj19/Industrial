@@ -10,6 +10,7 @@ using System.Collections.Generic;
 /// - JSON 한 줄(line) 단위 송수신
 /// - transition 전송: {"type":"transition", ...}
 /// - q_update 수신:   {"type":"q_update", "node_ids":[...], "q_values":[...]}
+/// - action_reply 수신: {"type":"action_reply", ...}  (DqnAgent에서 사용)
 /// </summary>
 public class DqnTcpClient : MonoBehaviour
 {
@@ -27,6 +28,7 @@ public class DqnTcpClient : MonoBehaviour
     volatile bool running = false;
     readonly object sendLock = new object();
 
+    // === q_update 큐 (기존) ===
     struct QUpdateItem
     {
         public int nodeId;
@@ -41,7 +43,32 @@ public class DqnTcpClient : MonoBehaviour
     /// </summary>
     public Action<int, float> OnQUpdate;
 
+    // === action_reply 큐 (신규) ===
+    struct ActionReplyItem
+    {
+        public int chosenNodeId;
+        public int[] candidateNodeIds;
+        public float[] qValues;
+        public float epsilon;
+        public bool isRandom;
+    }
+
+    readonly Queue<ActionReplyItem> actionReplyQueue = new Queue<ActionReplyItem>();
+    readonly object actionLock = new object();
+
+    /// <summary>
+    /// 메인 스레드에서 호출되는 콜백
+    /// (chosenNodeId, candidateNodeIds, qValues, epsilon, isRandom)
+    /// </summary>
+    public Action<int, int[], float[], float, bool> OnActionReply;
+
     // === 수신 메시지용 DTO ===
+    [Serializable]
+    class BaseMsg
+    {
+        public string type;
+    }
+
     [Serializable]
     class QUpdateMsg
     {
@@ -49,6 +76,26 @@ public class DqnTcpClient : MonoBehaviour
         public int[] node_ids;
         public float[] q_values;
     }
+
+    [Serializable]
+    class ActionReplyMsg
+    {
+        public string type;
+        public int chosen_node_id;
+        public int[] candidate_node_ids;
+        public float[] q_values;
+        public float epsilon;
+        public bool is_random;
+    }
+
+    // === DqnAgent용: 모든 수신 라인 큐 ===
+    readonly Queue<string> lineQueue = new Queue<string>();
+    readonly object lineLock = new object();
+
+    /// <summary>
+    /// 현재 TCP 연결 상태 (DqnAgent에서 사용)
+    /// </summary>
+    public bool IsConnected => client != null && client.Connected;
 
     void Start()
     {
@@ -58,26 +105,57 @@ public class DqnTcpClient : MonoBehaviour
 
     void Update()
     {
-        // 수신 스레드에서 쌓아둔 q_update를 메인 스레드에서 처리
-        if (OnQUpdate == null) return;
-
-        while (true)
+        // 1) q_update 처리 (기존)
+        if (OnQUpdate != null)
         {
-            QUpdateItem item;
-            lock (qLock)
+            while (true)
             {
-                if (qUpdateQueue.Count == 0)
-                    break;
-                item = qUpdateQueue.Dequeue();
-            }
+                QUpdateItem item;
+                lock (qLock)
+                {
+                    if (qUpdateQueue.Count == 0)
+                        break;
+                    item = qUpdateQueue.Dequeue();
+                }
 
-            try
-            {
-                OnQUpdate?.Invoke(item.nodeId, item.qValue);
+                try
+                {
+                    OnQUpdate?.Invoke(item.nodeId, item.qValue);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"[DqnTcpClient] OnQUpdate callback error: {e}");
+                }
             }
-            catch (Exception e)
+        }
+
+        // 2) action_reply 처리 (신규)
+        if (OnActionReply != null)
+        {
+            while (true)
             {
-                Debug.LogError($"[DqnTcpClient] OnQUpdate callback error: {e}");
+                ActionReplyItem item;
+                lock (actionLock)
+                {
+                    if (actionReplyQueue.Count == 0)
+                        break;
+                    item = actionReplyQueue.Dequeue();
+                }
+
+                try
+                {
+                    OnActionReply?.Invoke(
+                        item.chosenNodeId,
+                        item.candidateNodeIds,
+                        item.qValues,
+                        item.epsilon,
+                        item.isRandom
+                    );
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"[DqnTcpClient] OnActionReply callback error: {e}");
+                }
             }
         }
     }
@@ -122,6 +200,12 @@ public class DqnTcpClient : MonoBehaviour
 
         stream = null;
         client = null;
+
+        // 대기 중인 ReadLineBlocking 깨우기용
+        lock (lineLock)
+        {
+            Monitor.PulseAll(lineLock);
+        }
     }
 
     /// <summary>
@@ -148,6 +232,56 @@ public class DqnTcpClient : MonoBehaviour
         {
             Debug.LogError($"[DqnTcpClient] Send error: {e}");
             Close();
+        }
+    }
+
+    /// <summary>
+    /// RecvLoop에서 잘라낸 "한 줄"을 lineQueue에 넣고, 대기 중인 스레드를 깨움.
+    /// (DqnAgent.ReadLineBlocking에서 사용)
+    /// </summary>
+    void EnqueueLineForBlockingRead(string line)
+    {
+        lock (lineLock)
+        {
+            lineQueue.Enqueue(line);
+            Monitor.PulseAll(lineLock);
+        }
+    }
+
+    /// <summary>
+    /// DqnAgent에서 action_reply 등을 기다릴 때 사용하는 blocking read.
+    /// - timeoutMs 내에 수신된 첫 번째 라인을 반환
+    /// - 타임아웃/연결 끊김 시 null 반환
+    /// </summary>
+    public string ReadLineBlocking(int timeoutMs = 2000)
+    {
+        if (client == null || stream == null || !client.Connected)
+            return null;
+
+        lock (lineLock)
+        {
+            // 이미 큐에 라인이 있으면 바로 반환
+            if (lineQueue.Count > 0)
+                return lineQueue.Dequeue();
+
+            int remaining = timeoutMs;
+            DateTime start = DateTime.UtcNow;
+
+            while (true)
+            {
+                if (client == null || !client.Connected)
+                    return null;
+
+                if (lineQueue.Count > 0)
+                    return lineQueue.Dequeue();
+
+                if (remaining <= 0)
+                    return null;
+
+                Monitor.Wait(lineLock, remaining);
+
+                remaining = timeoutMs - (int)(DateTime.UtcNow - start).TotalMilliseconds;
+            }
         }
     }
 
@@ -182,7 +316,12 @@ public class DqnTcpClient : MonoBehaviour
                     sb.Remove(0, idx + 1);
 
                     if (!string.IsNullOrEmpty(line))
+                    {
+                        // 1) 메시지 타입별 처리
                         HandleLine(line);
+                        // 2) DqnAgent 등에서 blocking으로 읽을 수 있게 큐에 저장
+                        EnqueueLineForBlockingRead(line);
+                    }
                 }
             }
         }
@@ -198,36 +337,100 @@ public class DqnTcpClient : MonoBehaviour
     {
         try
         {
-            var msg = JsonUtility.FromJson<QUpdateMsg>(line);
-            if (msg != null && msg.type == "q_update" &&
-                msg.node_ids != null && msg.q_values != null)
+            // 먼저 type만 파싱
+            var baseMsg = JsonUtility.FromJson<BaseMsg>(line);
+            if (baseMsg == null || string.IsNullOrEmpty(baseMsg.type))
             {
-                int count = Mathf.Min(msg.node_ids.Length, msg.q_values.Length);
-                for (int i = 0; i < count; i++)
-                {
-                    lock (qLock)
-                    {
-                        qUpdateQueue.Enqueue(new QUpdateItem
-                        {
-                            nodeId = msg.node_ids[i],
-                            qValue = msg.q_values[i]
-                        });
-                    }
-                }
-
                 if (debugLogs)
+                    Debug.Log($"[DqnTcpClient] recv line (no type): {line}");
+                return;
+            }
+
+            // --------------------
+            // q_update 처리 (기존)
+            // --------------------
+            if (baseMsg.type == "q_update")
+            {
+                var msg = JsonUtility.FromJson<QUpdateMsg>(line);
+                if (msg != null && msg.node_ids != null && msg.q_values != null)
                 {
+                    int count = Mathf.Min(msg.node_ids.Length, msg.q_values.Length);
                     for (int i = 0; i < count; i++)
                     {
-                        Debug.Log($"[DqnTcpClient] q_update: node_id={msg.node_ids[i]}, Q={msg.q_values[i]:+0.000}");
+                        lock (qLock)
+                        {
+                            qUpdateQueue.Enqueue(new QUpdateItem
+                            {
+                                nodeId = msg.node_ids[i],
+                                qValue = msg.q_values[i]
+                            });
+                        }
+                    }
+
+                    if (debugLogs)
+                    {
+                        for (int i = 0; i < count; i++)
+                        {
+                            Debug.Log($"[DqnTcpClient] q_update: node_id={msg.node_ids[i]}, Q={msg.q_values[i]:+0.000}");
+                        }
                     }
                 }
+                else
+                {
+                    if (debugLogs)
+                        Debug.Log($"[DqnTcpClient] q_update parse error or empty arrays: {line}");
+                }
+
+                return;
             }
-            else
+
+            // --------------------
+            // action_reply 처리 (신규)
+            // --------------------
+            if (baseMsg.type == "action_reply")
             {
-                if (debugLogs)
-                    Debug.Log($"[DqnTcpClient] recv line (unknown): {line}");
+                var msg = JsonUtility.FromJson<ActionReplyMsg>(line);
+                if (msg != null)
+                {
+                    var item = new ActionReplyItem
+                    {
+                        chosenNodeId = msg.chosen_node_id,
+                        candidateNodeIds = msg.candidate_node_ids,
+                        qValues = msg.q_values,
+                        epsilon = msg.epsilon,
+                        isRandom = msg.is_random
+                    };
+
+                    lock (actionLock)
+                    {
+                        actionReplyQueue.Enqueue(item);
+                    }
+
+                    if (debugLogs)
+                    {
+                        string candStr = (msg.candidate_node_ids != null)
+                            ? string.Join(",", msg.candidate_node_ids)
+                            : "null";
+                        Debug.Log(
+                            $"[DqnTcpClient] action_reply: chosen={msg.chosen_node_id}, " +
+                            $"candidates=[{candStr}], eps={msg.epsilon:0.000}, random={msg.is_random}"
+                        );
+                    }
+                }
+                else
+                {
+                    if (debugLogs)
+                        Debug.Log($"[DqnTcpClient] action_reply parse error: {line}");
+                }
+
+                return;
             }
+
+            // --------------------
+            // 그 외 타입
+            // --------------------
+            if (debugLogs)
+                Debug.Log($"[DqnTcpClient] recv line (unknown type={baseMsg.type}): {line}");
         }
         catch (Exception e)
         {
