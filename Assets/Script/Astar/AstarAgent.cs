@@ -131,7 +131,7 @@ public class AStarAgent : MonoBehaviour
             transform.rotation = Quaternion.RotateTowards(
                 transform.rotation,
                 targetRot,
-                180f * Time.fixedDeltaTime);
+                360f * Time.fixedDeltaTime);
         }
     }
 }

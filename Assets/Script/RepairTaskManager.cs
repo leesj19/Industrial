@@ -8,6 +8,10 @@ public class RepairTaskManager : MonoBehaviour
     public AStarAgent robot;          // 수리 로봇 (A* 에이전트)
     public List<RepairSite> sites;    // 씬에서 등록할 RepairSite 목록
 
+    [Header("DQN Agent (optional)")]
+    [Tooltip("DQN 학습용 transition을 만들기 위한 에이전트 (없으면 DQN 연동 안 함)")]
+    public DqnAgent dqnAgent;
+
     [Header("선택 정책")]
     [Tooltip("여러 고장 사이트가 있을 때 무작위로 선택할지 여부 (false면 리스트 순서대로)")]
     public bool chooseRandomWhenMultiple = true;
@@ -91,6 +95,15 @@ public class RepairTaskManager : MonoBehaviour
             return;
         }
 
+        // ==== DQN 연동: 액션 선택 직후 상태 s_t 기록 ====
+        if (dqnAgent != null && currentTarget.tunnel != null)
+        {
+            int nodeId = currentTarget.tunnel.nodeId;
+            int actionId = nodeId;   // 일단 nodeId를 그대로 액션 ID처럼 사용 (추후 바꿔도 됨)
+
+            dqnAgent.RecordAction(actionId, nodeId);
+        }
+
         // 로봇의 목표를 이 RepairSite의 RepairPoint로 설정
         robot.SetTarget(currentTarget.RepairPoint, true);
         robotBusy = true;
@@ -144,6 +157,12 @@ public class RepairTaskManager : MonoBehaviour
         {
             site.OnRepaired();
             site.EndRepairVisual();
+        }
+
+        // ==== DQN 연동: 한 스텝(수리) 종료 시점에 s_{t+1}, reward 계산 ====
+        if (dqnAgent != null)
+        {
+            dqnAgent.FinishStepAndSend();
         }
 
         currentTarget = null;
