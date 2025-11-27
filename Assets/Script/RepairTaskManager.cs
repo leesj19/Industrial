@@ -138,21 +138,22 @@ public class RepairTaskManager : MonoBehaviour
             StartCoroutine(dqnAgent.CoRequestActionAndPickNode(
                 candidateNodeIds,
                 epsilon,
-                (chosenNodeId, success) =>
+                (chosenNodeId, isRandomFromEps) =>
                 {
                     // 이 콜백은 메인 스레드에서 실행됨
 
-                    if (!success)
+                    // ε decay (성공/실패와 상관없이 한 스텝 끝났다고 보고 감소)
+                    epsilon = Mathf.Max(epsilonMin, epsilon * epsilonDecay);
+
+                    // chosenNodeId가 비정상이면 fallback
+                    if (chosenNodeId < 0)
                     {
                         if (dqnAgent.debugLogs)
-                            Debug.LogWarning("[RepairTaskManager] DQN 액션 선택 실패 → 기본 정책으로 fallback");
+                            Debug.LogWarning("[RepairTaskManager] chosenNodeId < 0 → 기본 정책 fallback");
                         robotBusy = false;
                         PickAndAssignLocalPolicy();
                         return;
                     }
-
-                    // ε decay
-                    epsilon = Mathf.Max(epsilonMin, epsilon * epsilonDecay);
 
                     // chosenNodeId에 대응하는 RepairSite 찾기
                     currentTarget = null;
@@ -176,9 +177,14 @@ public class RepairTaskManager : MonoBehaviour
                         return;
                     }
 
+                    if (dqnAgent.debugLogs)
+                    {
+                        Debug.Log($"[RepairTaskManager] DQN 선택 nodeId={chosenNodeId}, epsRandom={isRandomFromEps}");
+                    }
+
                     // 로봇 이동 시작
                     robot.SetTarget(currentTarget.RepairPoint, true);
-                    robotBusy = true; // 이미 true 이지만 의미 명확히
+                    robotBusy = true; // 이미 true이지만 의미 명시
                 }));
         }
         else
