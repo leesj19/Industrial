@@ -111,7 +111,9 @@ public class FactoryEnvManager : MonoBehaviour
 
     // 최근에 계산된 글로벌 리워드 값
     private float _lastGlobalReward = 0f;
-
+    // 최근 관찰 윈도우에서 계산된 PL(T)와 정규화된 PL~
+    private float _lastWindowPlT = 0f;
+    private float _lastWindowPlNorm = 0f;
     // ===== 관찰 윈도우 기반 리워드 (R_t for one decision) =====
     [Header("RL Observation Window (per decision)")]
     [Tooltip("의사결정마다 T초 동안 PL/QD/FT/BT를 관찰해 윈도우 리워드를 계산할지 여부")]
@@ -229,7 +231,9 @@ public class FactoryEnvManager : MonoBehaviour
             );
 
             _lastGlobalReward = r;
-
+            // 🔹 관찰 윈도우 기준 PL(T), PL~ 저장
+            _lastWindowPlT = plT;
+            _lastWindowPlNorm = plN;
             Debug.Log(
                 $"[FactoryReward(instant)] R_total={r:F3} " +
                 $"(PL={plT:F2}, QD={qdT:F2}, FT={ftT}, BT={btT}, EC={ecT:F2}, RO={roT:F2} | " +
@@ -717,6 +721,21 @@ public class FactoryEnvManager : MonoBehaviour
     public float GetLastGlobalReward()
     {
         return _lastGlobalReward;
+    }
+        /// <summary>
+    /// 최근 관찰 윈도우의 PL(T) 원값
+    /// </summary>
+    public float GetLastWindowPl()
+    {
+        return _lastWindowPlT;
+    }
+
+    /// <summary>
+    /// 최근 관찰 윈도우의 정규화된 PL~ 값
+    /// </summary>
+    public float GetLastWindowPlNorm()
+    {
+        return _lastWindowPlNorm;
     }
 
     // ===================== Debug 출력 =====================

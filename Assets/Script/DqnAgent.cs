@@ -12,11 +12,10 @@ using Debug = UnityEngine.Debug;
 ///
 /// state 벡터 구성:
 ///   1) 터널 노드들만 nodeId 오름차순으로 정렬해서,
-///      각 노드마다 다음 5개 feature를 순서대로 붙임:
-///        [ stateIndex, queueCount, queueCapacity, isSinkFlag, supplyCount ]
+///      각 노드마다 다음 4개 feature를 순서대로 붙임:
+///        [ stateIndex, queueCount, queueCapacity, supplyCount ]
 ///        - stateIndex : RUN=0, HALF_HOLD=1, HOLD=2, FAULT=3
 ///        - queueCount / queueCapacity : 원값 (비율 X)
-///        - isSinkFlag : tunnel.isSink ? 1 : 0
 ///        - supplyCount : isSink이면 totalExitedCount, 아니면 0
 ///
 ///   2) 같은 터널 노드 순서로 adjacency matrix (N x N)를 row-major로 플랫하게 추가:
@@ -175,42 +174,42 @@ public class DqnAgent : MonoBehaviour
     ///   s_{t+1} 상태를 읽어 transition을 완성한다.
     /// (실제 호출 위치는 RepairTaskManager.CoRepairCurrentTarget 끝부분)
     /// </summary>
-public void FinishStepAndSend()
-{
-    // 아직 RecordAction이 안 된 상태면 할 일 없음
-    if (!hasPendingTransition)
-        return;
-
-    if (factoryEnv == null)
+    public void FinishStepAndSend()
     {
-        Debug.LogError("[DqnAgent] FactoryEnvManager 참조가 없습니다.");
-        return;
-    }
+        // 아직 RecordAction이 안 된 상태면 할 일 없음
+        if (!hasPendingTransition)
+            return;
 
-    // --- 이 step 전용으로 값 복사 ---
-    int actionId = lastActionId;
-    int nodeId = lastNodeId;
-    float[] state_t = lastState;
-
-    // 이 시점부터는 "다음 액션"을 막지 않도록 플래그 해제
-    hasPendingTransition = false;
-
-    // 관찰 윈도우 사용하는 경우: 여기서 시작 신호
-    if (factoryEnv.useObservationWindow)
-    {
-        factoryEnv.BeginRewardObservation();
-        if (debugLogs)
+        if (factoryEnv == null)
         {
-            Debug.Log(
-                $"[DqnAgent] BeginRewardObservation() 호출 - window T={factoryEnv.observationWindow:F2}s " +
-                $"(actionId={actionId}, nodeId={nodeId})"
-            );
+            Debug.LogError("[DqnAgent] FactoryEnvManager 참조가 없습니다.");
+            return;
         }
-    }
 
-    // 복사해둔 값들을 코루틴에 넘겨줌
-    StartCoroutine(CoWaitWindowAndSend(actionId, nodeId, state_t));
-}
+        // --- 이 step 전용으로 값 복사 ---
+        int actionId = lastActionId;
+        int nodeId = lastNodeId;
+        float[] state_t = lastState;
+
+        // 이 시점부터는 "다음 액션"을 막지 않도록 플래그 해제
+        hasPendingTransition = false;
+
+        // 관찰 윈도우 사용하는 경우: 여기서 시작 신호
+        if (factoryEnv.useObservationWindow)
+        {
+            factoryEnv.BeginRewardObservation();
+            if (debugLogs)
+            {
+                Debug.Log(
+                    $"[DqnAgent] BeginRewardObservation() 호출 - window T={factoryEnv.observationWindow:F2}s " +
+                    $"(actionId={actionId}, nodeId={nodeId})"
+                );
+            }
+        }
+
+        // 복사해둔 값들을 코루틴에 넘겨줌
+        StartCoroutine(CoWaitWindowAndSend(actionId, nodeId, state_t));
+    }
 
 
     /// <summary>
@@ -454,8 +453,8 @@ public void FinishStepAndSend()
     /// state 벡터를 구성.
     ///
     /// 1) 터널 노드들만 nodeId 오름차순으로 정렬해서,
-    ///    각 노드마다 다음 5개 feature를 붙임:
-    ///       [ stateIndex, queueCount, queueCapacity, isSinkFlag, supplyCount ]
+    ///    각 노드마다 다음 4개 feature를 붙임:
+    ///       [ stateIndex, queueCount, queueCapacity, supplyCount ]
     /// 2) 같은 터널 순서로 adjacency matrix (N x N, row-major)를 플랫하게 이어붙임.
     /// </summary>
     float[] BuildStateVector()
@@ -478,7 +477,7 @@ public void FinishStepAndSend()
         tunnelNodeIds.Sort();
         int n = tunnelNodeIds.Count;
 
-        // nodeId -> index (0..n-1) 매핑
+        // nodeId -> index (0..n-1) 매핑 (지금은 adjacency용)
         Dictionary<int, int> indexOfNode = new Dictionary<int, int>(n);
         for (int i = 0; i < n; i++)
         {
@@ -487,7 +486,8 @@ public void FinishStepAndSend()
 
         List<float> features = new List<float>();
 
-        // ----- (1) per-node feature 5개씩 -----
+        // ----- (1) per-node feature 3개씩 -----
+        // [ stateIndex, queueCount, queueCapacity ]
         for (int i = 0; i < n; i++)
         {
             int nodeId = tunnelNodeIds[i];
@@ -516,24 +516,10 @@ public void FinishStepAndSend()
             int qCount = data.queueCount;
             int qCap   = data.queueCapacity;
 
-            bool isSink = false;
-            int supplyCount = 0;
-
-            if (data.tunnel != null)
-            {
-                isSink = data.tunnel.isSink;
-                if (isSink)
-                {
-                    // 지금까지 배출된 제품 개수 (sink throughput)
-                    supplyCount = data.tunnel.totalExitedCount;
-                }
-            }
-
-            features.Add((float)stateIndex);   // state index
-            features.Add((float)qCount);       // queue count (원값)
-            features.Add((float)qCap);         // queue capacity (원값)
-            features.Add(isSink ? 1f : 0f);    // isSink flag
-            features.Add((float)supplyCount);  // 공급량/throughput (sink만 의미 있음)
+            // isSink / totalExitedCount (누적 PL)은 state에는 넣지 않는다.
+            features.Add((float)stateIndex);   // 0: 상태
+            features.Add((float)qCount);       // 1: 큐 길이
+            features.Add((float)qCap);         // 2: 큐 용량
         }
 
         // ----- (2) adjacency matrix (N x N, row-major) -----
@@ -565,8 +551,19 @@ public void FinishStepAndSend()
             }
         }
 
+        // ----- (3) 글로벌 PL 정보 한 칸 추가 (정규화된 PL~) -----
+        float plNorm = 0f;
+        if (factoryEnv != null)
+        {
+            // 관찰 윈도우를 사용하는 경우, 마지막 윈도우의 PL~ 값
+            // (FactoryEnvManager에 GetLastWindowPlNorm() 구현되어 있다고 가정)
+            plNorm = factoryEnv.GetLastWindowPlNorm();
+        }
+        features.Add(plNorm);
+
         return features.ToArray();
     }
+
 
     /// <summary>
     /// "지금 이 순간"의 글로벌 리워드 계산.
