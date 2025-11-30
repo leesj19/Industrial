@@ -7,6 +7,9 @@ using Random = UnityEngine.Random;
 
 public class RepairTaskManager : MonoBehaviour
 {
+    [Header("Debug 옵션")]
+    [Tooltip("로봇 이동 / 수리 상태 디버그 로그")]
+    public bool debugRobotFlow = true;
     [Header("로봇 & 대상들")]
     public AStarAgent robot;          // 수리 로봇 (A* 에이전트)
     public List<RepairSite> sites;    // 씬에서 등록할 RepairSite 목록
@@ -183,8 +186,7 @@ public class RepairTaskManager : MonoBehaviour
                     }
 
                     // 로봇 이동 시작
-                    robot.SetTarget(currentTarget.RepairPoint, true);
-                    robotBusy = true; // 이미 true이지만 의미 명시
+                    MoveRobotToCurrentTarget();
                 }));
         }
         else
@@ -252,6 +254,59 @@ public class RepairTaskManager : MonoBehaviour
             TryAssignNextTask();
         }
     }
+    /// <summary>
+    /// 현재 선택된 currentTarget 으로 로봇을 이동시킨다.
+    /// - 로봇이 이미 거의 도착한 상태라면 A* 경로를 타지 않고
+    ///   바로 HandleRobotArrived() 를 호출해서 '도착'으로 처리.
+    /// </summary>
+    void MoveRobotToCurrentTarget()
+    {
+        if (robot == null || currentTarget == null || currentTarget.RepairPoint == null)
+        {
+            robotBusy = false;
+            return;
+        }
+
+        // ① 로봇 위치와 목표 위치 거리 계산 (y축은 무시)
+        Vector3 robotPos = robot.transform.position;
+        Vector3 targetPos = currentTarget.RepairPoint.position;
+        robotPos.y = 0f;
+        targetPos.y = 0f;
+
+        float dist = Vector3.Distance(robotPos, targetPos);
+
+        if (debugRobotFlow)
+        {
+            int nodeId = (currentTarget.tunnel != null) ? currentTarget.tunnel.nodeId : -1;
+            Debug.Log($"[RepairTaskManager] MoveRobotToCurrentTarget: nodeId={nodeId}, dist={dist:F3}");
+        }
+
+        // ② 너무 가까우면(이미 도착했다고 볼 수 있는 거리) 곧장 도착 처리
+        //    - AStarAgent 가 경로 0 으로 OnPathFinished 를 안 부르는 경우를 방지
+        const float arriveThreshold = 0.3f;  // 필요하면 Inspector 에 빼도 됨
+
+        if (dist < arriveThreshold)
+        {
+            if (debugRobotFlow)
+            {
+                Debug.Log("[RepairTaskManager] 로봇이 이미 타겟 근처에 있음 → HandleRobotArrived() 직접 호출");
+            }
+
+            // path 없이 바로 도착 처리
+            HandleRobotArrived();
+            return;
+        }
+
+        // ③ 실제 이동 명령
+        if (debugRobotFlow)
+        {
+            Debug.Log("[RepairTaskManager] 로봇에 SetTarget 호출");
+        }
+
+        robot.SetTarget(currentTarget.RepairPoint, true);
+        robotBusy = true;   // 이미 true 일 수 있지만 의미를 명시
+    }
+
 
     /// <summary>
     /// 로봇이 도착한 뒤 repairDuration 만큼 기다렸다가 실제 수리 실행.
@@ -263,14 +318,7 @@ public class RepairTaskManager : MonoBehaviour
 
         if (site != null)
         {
-            // ==== DQN 연동: "수리 시작 시점"에서 s_t 기록 ====
-            if (dqnAgent != null && site.tunnel != null)
-            {
-                int nodeId = site.tunnel.nodeId;
-                int actionId = nodeId;   // 현재는 nodeId를 액션 ID처럼 사용
-                dqnAgent.RecordAction(actionId, nodeId);
-            }
-
+            // 🔹 수리 시작: 이제는 DQN 상태 기록 안 함
             site.BeginRepairVisual();
         }
 
@@ -290,16 +338,22 @@ public class RepairTaskManager : MonoBehaviour
 
         if (site != null)
         {
+            // 🔹 실제 수리 완료 시점
             site.OnRepaired();
             site.EndRepairVisual();
-            // 다시 고장났을 때 큐에 재등록될 수 있도록 플래그 리셋
             site.isQueued = false;
-        }
 
-        // ==== DQN 연동: "수리 끝난 직후"에 한 스텝 종료 처리 ====
-        if (dqnAgent != null)
-        {
-            dqnAgent.FinishStepAndSend();
+            // ==== DQN 연동: "수리 끝난 직후"에서 s_t 기록 + 윈도우 시작 ====
+            if (dqnAgent != null && site.tunnel != null)
+            {
+                int nodeId = site.tunnel.nodeId;
+                int actionId = nodeId;   // 현재는 nodeId를 액션 ID처럼 사용
+
+                // 여기서 s_t 스냅샷
+                dqnAgent.RecordAction(actionId, nodeId);
+                // 그리고 관찰 윈도우 시작 + T초 뒤 s_{t+1}, r_t 전송
+                dqnAgent.FinishStepAndSend();
+            }
         }
 
         currentTarget = null;
@@ -308,4 +362,5 @@ public class RepairTaskManager : MonoBehaviour
         // 수리 끝난 뒤, 아직 처리 안 한 다른 고장이 있으면 바로 다음 목적지 배정
         TryAssignNextTask();
     }
+
 }

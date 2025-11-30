@@ -51,6 +51,13 @@ public class DqnAgent : MonoBehaviour
     [Tooltip("중복 RecordAction 호출 시 스택트레이스를 찍을지 여부")]
     public bool logStackTraceOnDuplicateRecord = true;
 
+    [Header("State: distance feature")]
+    [Tooltip("true면 state에 '로봇→터널 거리'를 feature로 포함")]
+    public bool includeRobotDistance = true;
+
+    [Tooltip("거리 정규화 스케일 (dist / scale, 예: 50f면 최대 50m 기준)")]
+    public float distanceNormScale = 50f;
+
     // ===== Transition 버퍼 =====
     float[] lastState;     // s_t (수리 시작 순간의 상태)
     int lastActionId = -1; // "몇 번째 액션"인지 (액션 인덱스 등)
@@ -120,10 +127,10 @@ public class DqnAgent : MonoBehaviour
     // =========================
 
     /// <summary>
-    /// "수리를 시작하는 순간"에 한 번 호출.
+    /// "수리가 끝난 직후(다음 액션을 선택하기 직전)"에 한 번 호출.
     /// - 현재 상태 s_t를 저장하고
     /// - 어떤 액션/노드를 선택했는지 기억해둔다.
-    /// (실제 호출 위치는 RepairTaskManager.CoRepairCurrentTarget 시작부)
+    /// (실제 호출 위치는 RepairTaskManager.CoRepairCurrentTarget 끝부분)
     /// </summary>
     public void RecordAction(int actionId, int nodeId)
     {
@@ -133,7 +140,6 @@ public class DqnAgent : MonoBehaviour
             return;
         }
 
-        // *** 중요: 이전 transition이 아직 안 끝났는데 다시 RecordAction이 호출되는 경우 감지 ***
         if (hasPendingTransition)
         {
             Debug.LogWarning(
@@ -146,10 +152,9 @@ public class DqnAgent : MonoBehaviour
                 var st = new StackTrace(true);
                 Debug.Log($"[DqnAgent] 중복 RecordAction 호출 스택트레이스:\n{st}");
             }
-            // 여기서는 가장 최근 액션 기준으로 덮어쓰는 쪽을 택함.
         }
 
-        // === s_t 스냅샷 ===
+        // === s_t 스냅샷 (수리 끝난 현재 상태) ===
         lastState = BuildStateVector(); // s_t
         lastActionId = actionId;
         lastNodeId = nodeId;
@@ -157,15 +162,14 @@ public class DqnAgent : MonoBehaviour
 
         if (debugLogs)
         {
-            Debug.Log($"[DqnAgent] RecordAction (수리 시작): actionId={actionId}, nodeId={nodeId}, state_dim={lastState?.Length ?? 0}");
+            Debug.Log($"[DqnAgent] RecordAction (수리 끝): actionId={actionId}, nodeId={nodeId}, state_dim={lastState?.Length ?? 0}");
             if (logStateVector)
             {
                 DebugLogState("s_t", lastState);
             }
         }
-
-        // 관찰 윈도우는 "수리 끝난 직후"에 시작할 것이라 여기서는 호출하지 않음.
     }
+
 
     /// <summary>
     /// "수리가 끝난 직후"에 호출.
@@ -477,6 +481,14 @@ public class DqnAgent : MonoBehaviour
         tunnelNodeIds.Sort();
         int n = tunnelNodeIds.Count;
 
+        Vector3 robotPos = Vector3.zero;
+        bool hasRobot = false;
+        if (repairTaskManager != null && repairTaskManager.robot != null)
+        {
+            hasRobot = true;
+            robotPos = repairTaskManager.robot.transform.position;
+        }
+
         // nodeId -> index (0..n-1) 매핑 (지금은 adjacency용)
         Dictionary<int, int> indexOfNode = new Dictionary<int, int>(n);
         for (int i = 0; i < n; i++)
@@ -486,41 +498,59 @@ public class DqnAgent : MonoBehaviour
 
         List<float> features = new List<float>();
 
-        // ----- (1) per-node feature 3개씩 -----
-        // [ stateIndex, queueCount, queueCapacity ]
-        for (int i = 0; i < n; i++)
+    // ----- (1) per-node feature -----
+    // [ stateIndex, queueCount, queueCapacity, distanceFromRobot ]
+    for (int i = 0; i < n; i++)
+    {
+        int nodeId = tunnelNodeIds[i];
+        if (!nodesDict.TryGetValue(nodeId, out var data))
+            continue;
+
+        // 상태 인덱스
+        int stateIndex = 0;
+        switch (data.tunnelState)
         {
-            int nodeId = tunnelNodeIds[i];
-            if (!nodesDict.TryGetValue(nodeId, out var data))
-                continue;
-
-            // 상태 인덱스: RUN=0, HALF_HOLD=1, HOLD=2, FAULT=3
-            int stateIndex = 0;
-            switch (data.tunnelState)
-            {
-                case TunnelController.TunnelState.HALF_HOLD:
-                    stateIndex = 1;
-                    break;
-                case TunnelController.TunnelState.HOLD:
-                    stateIndex = 2;
-                    break;
-                case TunnelController.TunnelState.FAULT:
-                    stateIndex = 3;
-                    break;
-                case TunnelController.TunnelState.RUN:
-                default:
-                    stateIndex = 0;
-                    break;
-            }
-
-            int qCount = data.queueCount;
-            int qCap   = data.queueCapacity;
-
-            // isSink / totalExitedCount (누적 PL)은 state에는 넣지 않는다.
-            features.Add((float)stateIndex);   // 0: 상태
-            features.Add((float)qCount);       // 1: 큐 길이
-            features.Add((float)qCap);         // 2: 큐 용량
+            case TunnelController.TunnelState.HALF_HOLD:
+                stateIndex = 1;
+                break;
+            case TunnelController.TunnelState.HOLD:
+                stateIndex = 2;
+                break;
+            case TunnelController.TunnelState.FAULT:
+                stateIndex = 3;
+                break;
+            case TunnelController.TunnelState.RUN:
+            default:
+                stateIndex = 0;
+                break;
         }
+
+        int qCount = data.queueCount;
+        int qCap   = data.queueCapacity;
+
+        // --- 거리 계산 (로봇→터널) ---
+        float distNorm = 0f;
+        if (includeRobotDistance && hasRobot && data.tunnel != null)
+        {
+            Vector3 nodePos = data.tunnel.transform.position;
+
+            // y는 무시하고 x-z 평면 거리만 써도 충분
+            float dx = nodePos.x - robotPos.x;
+            float dz = nodePos.z - robotPos.z;
+            float dist = Mathf.Sqrt(dx * dx + dz * dz);
+
+            float scale = Mathf.Max(1e-3f, distanceNormScale);
+            distNorm = Mathf.Clamp01(dist / scale);
+        }
+        // -----------------------------
+
+        features.Add((float)stateIndex);   // 0: 상태
+        features.Add((float)qCount);       // 1: 큐 길이
+        features.Add((float)qCap);         // 2: 큐 용량
+        if (includeRobotDistance)
+            features.Add(distNorm);        // 3: 로봇까지 거리 (0~1)
+    }
+
 
         // ----- (2) adjacency matrix (N x N, row-major) -----
         var adjacency = factoryEnv.Adjacency; // nodeId 기반 인접 리스트
