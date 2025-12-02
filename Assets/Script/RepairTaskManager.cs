@@ -254,11 +254,6 @@ public class RepairTaskManager : MonoBehaviour
             TryAssignNextTask();
         }
     }
-    /// <summary>
-    /// 현재 선택된 currentTarget 으로 로봇을 이동시킨다.
-    /// - 로봇이 이미 거의 도착한 상태라면 A* 경로를 타지 않고
-    ///   바로 HandleRobotArrived() 를 호출해서 '도착'으로 처리.
-    /// </summary>
     void MoveRobotToCurrentTarget()
     {
         if (robot == null || currentTarget == null || currentTarget.RepairPoint == null)
@@ -275,37 +270,53 @@ public class RepairTaskManager : MonoBehaviour
 
         float dist = Vector3.Distance(robotPos, targetPos);
 
+        int nodeId = (currentTarget.tunnel != null) ? currentTarget.tunnel.nodeId : -1;
+
         if (debugRobotFlow)
         {
-            int nodeId = (currentTarget.tunnel != null) ? currentTarget.tunnel.nodeId : -1;
             Debug.Log($"[RepairTaskManager] MoveRobotToCurrentTarget: nodeId={nodeId}, dist={dist:F3}");
         }
 
-        // ② 너무 가까우면(이미 도착했다고 볼 수 있는 거리) 곧장 도착 처리
-        //    - AStarAgent 가 경로 0 으로 OnPathFinished 를 안 부르는 경우를 방지
-        const float arriveThreshold = 0.3f;  // 필요하면 Inspector 에 빼도 됨
+        // 🔹 1) "완전 같은 자리"면 그냥 바로 수리 시작
+        const float immediateRepairThreshold = 0.05f;   // 거의 같은 위치(5cm 이내)라고 보는 기준
 
-        if (dist < arriveThreshold)
+        if (dist <= immediateRepairThreshold)
         {
             if (debugRobotFlow)
             {
-                Debug.Log("[RepairTaskManager] 로봇이 이미 타겟 근처에 있음 → HandleRobotArrived() 직접 호출");
+                Debug.Log($"[RepairTaskManager] 로봇이 이미 터널 {nodeId} 수리 위치에 있음 → 즉시 재수리 시작");
             }
 
-            // path 없이 바로 도착 처리
+            robotBusy = true;   // 이 수리 동안은 바쁘다고 표시
+            StartCoroutine(CoRepairCurrentTarget(currentTarget));
+            return;
+        }
+
+        // 🔹 2) 조금 떨어져 있긴 하지만, 거의 근처라면 도착으로 처리 (선택사항)
+        const float arriveThreshold = 0.6f;  // 필요에 따라 0.5~1.0 사이로 조절
+
+        if (dist <= arriveThreshold)
+        {
+            if (debugRobotFlow)
+            {
+                Debug.Log($"[RepairTaskManager] 로봇이 터널 {nodeId} 근처({dist:F3}) → HandleRobotArrived()로 처리");
+            }
+
             HandleRobotArrived();
             return;
         }
 
-        // ③ 실제 이동 명령
+        // 🔹 3) 그 외에는 정상적으로 A* 경로 따라 이동
         if (debugRobotFlow)
         {
-            Debug.Log("[RepairTaskManager] 로봇에 SetTarget 호출");
+            Debug.Log("[RepairTaskManager] 로봇에 SetTarget 호출 (A* 이동)");
         }
 
         robot.SetTarget(currentTarget.RepairPoint, true);
-        robotBusy = true;   // 이미 true 일 수 있지만 의미를 명시
+        robotBusy = true;
     }
+
+
 
 
     /// <summary>

@@ -28,6 +28,12 @@ public class DqnTcpClient : MonoBehaviour
     volatile bool running = false;
     readonly object sendLock = new object();
 
+        // === (추가) RecvLoop에서 넘어온 로그 메시지 큐 ===
+    readonly Queue<string> logQueue = new Queue<string>();
+    readonly object logLock = new object();
+    // === RecvLoop → 메인 스레드로 넘길 수신 라인 큐 ===
+    readonly Queue<string> pendingLines = new Queue<string>();
+    readonly object pendingLock = new object();
     // === q_update 큐 (기존) ===
     struct QUpdateItem
     {
@@ -88,9 +94,9 @@ public class DqnTcpClient : MonoBehaviour
         public bool is_random;
     }
 
-    // === DqnAgent용: 모든 수신 라인 큐 ===
-    readonly Queue<string> lineQueue = new Queue<string>();
-    readonly object lineLock = new object();
+    // // === DqnAgent용: 모든 수신 라인 큐 ===
+    // readonly Queue<string> lineQueue = new Queue<string>();
+    // readonly object lineLock = new object();
 
     /// <summary>
     /// 현재 TCP 연결 상태 (DqnAgent에서 사용)
@@ -105,6 +111,35 @@ public class DqnTcpClient : MonoBehaviour
 
     void Update()
     {
+        // -1) (추가) RecvLoop에서 쌓아둔 로그를 메인 스레드에서 출력
+        while (true)
+        {
+            string log;
+            lock (logLock)
+            {
+                if (logQueue.Count == 0)
+                    break;
+                log = logQueue.Dequeue();
+            }
+
+            Debug.Log(log);
+        }
+
+        // 0) RecvLoop에서 넘어온 수신 라인들 먼저 처리
+        while (true)
+        {
+            string line;
+            lock (pendingLock)
+            {
+                if (pendingLines.Count == 0)
+                    break;
+                line = pendingLines.Dequeue();
+            }
+
+            // 이제는 메인 스레드에서만 HandleLine을 호출
+            HandleLine(line);
+        }
+
         // 1) q_update 처리 (기존)
         if (OnQUpdate != null)
         {
@@ -129,7 +164,7 @@ public class DqnTcpClient : MonoBehaviour
             }
         }
 
-        // 2) action_reply 처리 (신규)
+        // 2) action_reply 처리 (기존)
         if (OnActionReply != null)
         {
             while (true)
@@ -159,6 +194,7 @@ public class DqnTcpClient : MonoBehaviour
             }
         }
     }
+
 
     void OnDestroy()
     {
@@ -202,10 +238,10 @@ public class DqnTcpClient : MonoBehaviour
         client = null;
 
         // 대기 중인 ReadLineBlocking 깨우기용
-        lock (lineLock)
-        {
-            Monitor.PulseAll(lineLock);
-        }
+        // lock (lineLock)
+        // {
+        //     Monitor.PulseAll(lineLock);
+        // }
     }
 
     /// <summary>
@@ -235,55 +271,55 @@ public class DqnTcpClient : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// RecvLoop에서 잘라낸 "한 줄"을 lineQueue에 넣고, 대기 중인 스레드를 깨움.
-    /// (DqnAgent.ReadLineBlocking에서 사용)
-    /// </summary>
-    void EnqueueLineForBlockingRead(string line)
-    {
-        lock (lineLock)
-        {
-            lineQueue.Enqueue(line);
-            Monitor.PulseAll(lineLock);
-        }
-    }
+    // /// <summary>
+    // /// RecvLoop에서 잘라낸 "한 줄"을 lineQueue에 넣고, 대기 중인 스레드를 깨움.
+    // /// (DqnAgent.ReadLineBlocking에서 사용)
+    // /// </summary>
+    // void EnqueueLineForBlockingRead(string line)
+    // {
+    //     lock (lineLock)
+    //     {
+    //         lineQueue.Enqueue(line);
+    //         Monitor.PulseAll(lineLock);
+    //     }
+    // }
 
-    /// <summary>
-    /// DqnAgent에서 action_reply 등을 기다릴 때 사용하는 blocking read.
-    /// - timeoutMs 내에 수신된 첫 번째 라인을 반환
-    /// - 타임아웃/연결 끊김 시 null 반환
-    /// </summary>
-    public string ReadLineBlocking(int timeoutMs = 2000)
-    {
-        if (client == null || stream == null || !client.Connected)
-            return null;
+    // /// <summary>
+    // /// DqnAgent에서 action_reply 등을 기다릴 때 사용하는 blocking read.
+    // /// - timeoutMs 내에 수신된 첫 번째 라인을 반환
+    // /// - 타임아웃/연결 끊김 시 null 반환
+    // /// </summary>
+    // public string ReadLineBlocking(int timeoutMs = 2000)
+    // {
+    //     if (client == null || stream == null || !client.Connected)
+    //         return null;
 
-        lock (lineLock)
-        {
-            // 이미 큐에 라인이 있으면 바로 반환
-            if (lineQueue.Count > 0)
-                return lineQueue.Dequeue();
+    //     lock (lineLock)
+    //     {
+    //         // 이미 큐에 라인이 있으면 바로 반환
+    //         if (lineQueue.Count > 0)
+    //             return lineQueue.Dequeue();
 
-            int remaining = timeoutMs;
-            DateTime start = DateTime.UtcNow;
+    //         int remaining = timeoutMs;
+    //         DateTime start = DateTime.UtcNow;
 
-            while (true)
-            {
-                if (client == null || !client.Connected)
-                    return null;
+    //         while (true)
+    //         {
+    //             if (client == null || !client.Connected)
+    //                 return null;
 
-                if (lineQueue.Count > 0)
-                    return lineQueue.Dequeue();
+    //             if (lineQueue.Count > 0)
+    //                 return lineQueue.Dequeue();
 
-                if (remaining <= 0)
-                    return null;
+    //             if (remaining <= 0)
+    //                 return null;
 
-                Monitor.Wait(lineLock, remaining);
+    //             Monitor.Wait(lineLock, remaining);
 
-                remaining = timeoutMs - (int)(DateTime.UtcNow - start).TotalMilliseconds;
-            }
-        }
-    }
+    //             remaining = timeoutMs - (int)(DateTime.UtcNow - start).TotalMilliseconds;
+    //         }
+    //     }
+    // }
 
     void RecvLoop()
     {
@@ -298,7 +334,12 @@ public class DqnTcpClient : MonoBehaviour
                 if (n <= 0)
                 {
                     if (debugLogs)
-                        Debug.Log("[DqnTcpClient] Connection closed by server.");
+                    {
+                        lock (logLock)
+                        {
+                            logQueue.Enqueue("[DqnTcpClient] Connection closed by server.");
+                        }
+                    }
                     break;
                 }
 
@@ -315,19 +356,30 @@ public class DqnTcpClient : MonoBehaviour
                     string line = current.Substring(0, idx).Trim();
                     sb.Remove(0, idx + 1);
 
-                    if (!string.IsNullOrEmpty(line))
+                if (!string.IsNullOrEmpty(line))
+                {
+                    // 1) 메인 스레드에서 처리할 수 있도록 pendingLines에만 쌓기
+                    lock (pendingLock)
                     {
-                        // 1) 메시지 타입별 처리
-                        HandleLine(line);
-                        // 2) DqnAgent 등에서 blocking으로 읽을 수 있게 큐에 저장
-                        EnqueueLineForBlockingRead(line);
+                        pendingLines.Enqueue(line);
                     }
+
+                    // 2) (현재 구조에선 ReadLineBlocking을 사용하지 않으므로
+                    //     lineQueue에 따로 쌓지 않는다)
+                    // EnqueueLineForBlockingRead(line);
+                }
+
+
                 }
             }
         }
         catch (Exception e)
         {
-            Debug.LogError($"[DqnTcpClient] RecvLoop error: {e}");
+            // 여기서는 직접 Debug.LogError 찍지 말고 큐에 쌓기
+            lock (logLock)
+            {
+                logQueue.Enqueue($"[DqnTcpClient] RecvLoop error: {e}");
+            }
         }
 
         running = false;
