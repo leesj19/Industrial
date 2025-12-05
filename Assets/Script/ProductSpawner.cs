@@ -42,6 +42,11 @@ public class ProductSpawner : MonoBehaviour
     public TargetPath path;
     public Transform spawnPoint;   // 없으면 path 첫 포인트 사용
 
+    // ====== Product Settings ======
+    [Header("Product Settings")]
+    [Tooltip("스폰된 product가 살아 있을 최대 시간(초). 0 이하면 무제한.")]
+    public float productLifetimeSeconds = 300f;  // 기본 5분
+
     // ====== Spawn Policy ======
     [Header("Spawn Policy")]
     [Tooltip("시작하자마자 자동 스폰할지 여부")]
@@ -88,7 +93,8 @@ public class ProductSpawner : MonoBehaviour
             return;
 
         var go = pool.Get();
-        if (go == null) return;
+        if (go == null)
+            return;
 
         Vector3 pos = spawnPoint ? spawnPoint.position : path.GetPoint(0).position;
         go.transform.SetPositionAndRotation(pos, Quaternion.identity);
@@ -100,6 +106,9 @@ public class ProductSpawner : MonoBehaviour
         var ret = go.GetComponent<ReturnToPoolOnFinish>();
         if (!ret) ret = go.AddComponent<ReturnToPoolOnFinish>();
         ret.pool = pool;
+
+        if (productLifetimeSeconds > 0f)
+            ret.lifetimeSeconds = productLifetimeSeconds;
     }
 
     // ====== External control (from upstream tunnel) ======
