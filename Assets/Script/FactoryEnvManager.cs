@@ -16,10 +16,16 @@ public class FactoryEnvManager : MonoBehaviour
 {
     // ==== Singleton (편의용) ====
     public static FactoryEnvManager Instance { get; private set; }
+    [Header("Debug / PL Logs")]
+[Tooltip("관찰 윈도우가 끝날 때 PL(T) 값을 로그로 출력할지 여부")]
+public bool debugLogWindowPl = true;
 
     [Header("Scene References (비워두면 자동 찾기)")]
     public ProductSpawner[] spawners;
     public TunnelController[] tunnels;
+    // 즉시형 글로벌 리워드용: 지난 로그 시점의 sink throughput 저장
+    private Dictionary<TunnelController, int> _prevSinkExitCountsInstant
+        = new Dictionary<TunnelController, int>();
 
     // nodeId -> NodeData
     private Dictionary<int, NodeData> nodes = new Dictionary<int, NodeData>();
@@ -114,6 +120,20 @@ public class FactoryEnvManager : MonoBehaviour
     // 최근 관찰 윈도우에서 계산된 PL(T)와 정규화된 PL~
     private float _lastWindowPlT = 0f;
     private float _lastWindowPlNorm = 0f;
+
+    // === 전역 throughput 카운터 (ReturnToPoolOnFinish에서 증가시킴) ===
+    private int _globalExitCount = 0;           // 지금까지 끝까지 간 Product 수
+    private int _exitCountAtObsStart = 0;       // 관찰 윈도우 시작 시점의 값
+    // 🔹 instant PL 계산용: 지난 instant 로그 시점의 값
+    private int _prevGlobalExitCountInstant = 0;
+    /// <summary>
+    /// Product가 경로를 끝까지 따라간 뒤 풀로 리턴될 때 호출되는 전역 카운터
+    /// </summary>
+    public void RegisterProductExit()
+    {
+        _globalExitCount++;
+    }
+
     // ===== 관찰 윈도우 기반 리워드 (R_t for one decision) =====
     [Header("RL Observation Window (per decision)")]
     [Tooltip("의사결정마다 T초 동안 PL/QD/FT/BT를 관찰해 윈도우 리워드를 계산할지 여부")]
@@ -263,6 +283,9 @@ public class FactoryEnvManager : MonoBehaviour
         _sampleCount = 0;
         _sinkStartCounts.Clear();
 
+        // 🔸 관찰 시작 시점의 전역 throughput 카운트 저장
+        _exitCountAtObsStart = _globalExitCount;
+        
         if (tunnels != null)
         {
             foreach (var t in tunnels)
@@ -309,11 +332,11 @@ public class FactoryEnvManager : MonoBehaviour
         _sampleCount++;
     }
 
-    /// <summary>
-    /// 관찰 윈도우가 끝났을 때 호출.
-    /// 평균 QD/FT/BT와 sink throughput delta로 PL(T)을 계산하고,
-    /// 글로벌 리워드를 한 번 로그로 출력한다.
-    /// </summary>
+        /// <summary>
+        /// 관찰 윈도우가 끝났을 때 호출.
+        /// 평균 QD/FT/BT와 sink throughput delta로 PL(T)을 계산하고,
+        /// 글로벌 리워드를 한 번 로그로 출력한다.
+        /// </summary>
     void FinishObservationAndComputeReward()
     {
         _isObserving = false;
@@ -328,22 +351,9 @@ public class FactoryEnvManager : MonoBehaviour
         float ecT = 0f;
         float roT = 0f;
 
-        // PL(T): sink 터널들의 throughput 증가량 합
-        int totalDeltaExit = 0;
-        if (tunnels != null)
-        {
-            foreach (var t in tunnels)
-            {
-                if (t == null || !t.isSink) continue;
-
-                int startCount = 0;
-                _sinkStartCounts.TryGetValue(t, out startCount);
-                int delta = t.totalExitedCount - startCount;
-                if (delta > 0)
-                    totalDeltaExit += delta;
-            }
-        }
-        float plT = totalDeltaExit;
+        // 🔸 PL(T): 관찰 윈도우 동안 "끝까지 간" 제품 수 (전역 카운터 delta)
+        int deltaExit = Mathf.Max(0, _globalExitCount - _exitCountAtObsStart);
+        float plT = deltaExit;
 
         float plN, qdN, ftN, btN, ecN, roN;
         float r = ComputeGlobalRewardFromValues(
@@ -352,7 +362,14 @@ public class FactoryEnvManager : MonoBehaviour
         );
 
         _lastGlobalReward = r;
-
+        if (debugLogWindowPl)
+        {
+            Debug.Log(
+                $"[FactoryReward/PL] window={observationWindow:F1}s, " +
+                $"PL(T)={plT}, PL_norm={plN:F3}, " +
+                $"QD_avg={avgQD:F2}, FT_avg={avgFT:F2}, BT_avg={avgBT:F2}"
+            );
+        }
         if (debugLogGlobalReward)
         {
             Debug.Log(
@@ -362,6 +379,7 @@ public class FactoryEnvManager : MonoBehaviour
             );
         }
     }
+
 
     // ===================== 노드 인덱스 =====================
 
@@ -628,13 +646,12 @@ public class FactoryEnvManager : MonoBehaviour
     /// 현재 상태에서 PL(T), QD(T), FT(T), BT(T), EC(T), RO(T)를
     /// 단순하게 추정한다.
     /// </summary>
-    void ComputeRawMetrics(
+        void ComputeRawMetrics(
         out float PL, out float QD,
         out float FT, out float BT,
         out float EC, out float RO)
     {
-        // PL은 기본적으로 0으로 두고,
-        // 실제 throughput은 관찰 윈도우 기반으로 plT에서 계산하는 것을 추천.
+        // 0으로 초기화
         PL = 0f;
         QD = 0f;
         FT = 0f;
@@ -642,12 +659,12 @@ public class FactoryEnvManager : MonoBehaviour
         EC = 0f;
         RO = 0f;
 
+        // 1) QD / FT / BT : 전체 터널 스냅샷 기준
         foreach (var kv in nodes)
         {
             var n = kv.Value;
             if (n.isSpawner) continue;
 
-            // 큐 길이 합(단순 QD 근사)
             QD += n.queueCount;
 
             switch (n.tunnelState)
@@ -661,7 +678,19 @@ public class FactoryEnvManager : MonoBehaviour
                     break;
             }
         }
+
+        // 2) PL : 지난 instant 로그 이후 끝까지 간 제품 수 (전역 카운터 delta)
+        int deltaExit = _globalExitCount - _prevGlobalExitCountInstant;
+        if (deltaExit > 0)
+            PL = deltaExit;
+        else
+            PL = 0f;
+
+        _prevGlobalExitCountInstant = _globalExitCount;
+
+        // EC, RO는 나중에 로봇 이동/수리 횟수 붙이고 싶을 때 채우면 됨.
     }
+
 
     /// <summary>
     /// 주어진 PL/QD/FT/BT/EC/RO 값으로부터

@@ -51,6 +51,9 @@ public class TunnelController : MonoBehaviour
     [Header("Failure Model (터널 고장 모델 선택)")]
     [SerializeField] private FailureModel failureModel = FailureModel.Constant;
 
+    [Tooltip("true면 제품 개수 기반 확률 고장을 사용, false면 시나리오 등에서 외부 ForceFail만 사용")]
+    public bool useItemFailure = true;
+
     [Header("Failure - Constant (Items-based)")]
     [Tooltip("평균 몇 개의 제품을 처리하면 고장날지 (지수/기하 분포 기반)")]
     public float constantMeanItemsToFailure = 200f;
@@ -288,8 +291,8 @@ public class TunnelController : MonoBehaviour
     {
         if (!follower) return;
 
-        // 제품 개수 기반 고장 체크
-        if (!IsFault)
+        // 제품 개수 기반 고장 체크 (시나리오에서는 useItemFailure=false로 꺼둘 수 있음)
+        if (useItemFailure && !IsFault)
         {
             itemsSinceLastFailure++;
 
@@ -339,7 +342,8 @@ public class TunnelController : MonoBehaviour
         // 레거시 호환용, 아무 것도 안 함
     }
 
-    // ===== 큐 방출 =====
+        // ===== 큐 방출 =====
+        // ===== 큐 방출 =====
     void TryDrainQueue(bool force = false)
     {
         if (queue == null || queue.IsEmpty) return;
@@ -363,11 +367,8 @@ public class TunnelController : MonoBehaviour
             if (afterTunnelPoint != null)
                 follower.transform.SetPositionAndRotation(afterTunnelPoint.position, afterTunnelPoint.rotation);
 
-            // ★ sink라면 여기서 throughput 카운트 증가
-            if (isSink)
-            {
-                totalExitedCount++;
-            }
+            // ❌ 여기서 throughput 카운트 하던 코드 제거
+            // if (isSink) { totalExitedCount++; }
 
             follower.enabled = true;
             follower.Resume();
@@ -393,6 +394,7 @@ public class TunnelController : MonoBehaviour
             nextDrainAt = Time.time + cd;
         }
     }
+
 
     // ===== 실패 / 수리 =====
     public void ForceFail() => SetFailed(true);
@@ -725,14 +727,24 @@ public class TunnelController : MonoBehaviour
     }
 
     // ===== Failure Items 수명 리셋 & 샘플링 =====
+    // ===== Failure Items 수명 리셋 & 샘플링 =====
     void ResetFailureCounters()
     {
         itemsSinceLastFailure = 0;
-        nextFailureAtItem = SampleNextFailureItem();
+
+        if (useItemFailure)
+        {
+            nextFailureAtItem = SampleNextFailureItem();
+        }
+        else
+        {
+            // 시나리오 모드 등에서 확률 고장 끌 때는 사실상 고장 안 나게 막아둠
+            nextFailureAtItem = int.MaxValue;
+        }
 
         if (debugLogs)
         {
-            Debug.Log(Format($"[FAILURE RESET] nextFailureAtItem={nextFailureAtItem} (model={failureModel})"));
+            Debug.Log(Format($"[FAILURE RESET] nextFailureAtItem={nextFailureAtItem} (model={failureModel}, useItemFailure={useItemFailure})"));
         }
     }
 

@@ -1,102 +1,79 @@
 using UnityEngine;
 
-/// <summary>
-/// Product가 경로(PathFollower)를 따라가다가
-/// - 경로 끝(PathFollower.OnFinished)에 도달했을 때
-/// - 혹은 lifetimeSeconds 이상 시간이 지났을 때
-/// 풀(ProductPool)로 되돌리는 스크립트.
-/// </summary>
 [DisallowMultipleComponent]
 public class ReturnToPoolOnFinish : MonoBehaviour
 {
     [Header("Pool 설정")]
-    [Tooltip("이 Product를 되돌려 보낼 풀")]
-    public ProductPool pool;      // ProductSpawner에서 할당
+    public ProductPool pool;
 
     [Header("수명 설정")]
-    [Tooltip("생성 후 이 시간이 지나면 자동 회수 (초). 0 이하이면 수명 제한 없음")]
-    public float lifetimeSeconds = 0f;   // 기본값: 무한 수명
+    [Tooltip("0 이하면 시간 기반 회수는 안 하고, 경로 완료 시에만 회수")]
+    public float lifetimeSeconds = 300f;
 
-    // 내부 상태
-    private float elapsed = 0f;
-    private bool  isReturned = false;
-
-    // Path 끝 이벤트를 받기 위한 참조
     private PathFollower follower;
+    private float spawnTime;
+    private bool subscribed = false;
 
     private void Awake()
     {
-        // 같은 오브젝트에 붙어 있는 PathFollower를 찾는다.
         follower = GetComponent<PathFollower>();
     }
 
     private void OnEnable()
     {
-        elapsed    = 0f;
-        isReturned = false;
+        spawnTime = Time.time;
 
-        // 경로 끝(OnFinished) 이벤트 구독
-        if (follower != null)
+        // PathFollower의 경로 완료 이벤트에 구독
+        if (follower != null && !subscribed)
         {
-            follower.OnFinished -= HandlePathFinished;  // 중복 구독 방지
             follower.OnFinished += HandlePathFinished;
+            subscribed = true;
         }
     }
 
     private void OnDisable()
     {
-        // 이벤트 해제 (메모리 누수/예상치 못한 콜백 방지)
-        if (follower != null)
+        if (follower != null && subscribed)
         {
             follower.OnFinished -= HandlePathFinished;
+            subscribed = false;
         }
     }
 
     private void Update()
     {
-        if (isReturned) return;
-
-        // 수명 제한이 있을 때만 타이머 체크
-        if (lifetimeSeconds > 0f)
+        // 수명 초과로 회수할 때는 "생산 완료"로 보지 않음
+        if (lifetimeSeconds > 0f &&
+            Time.time - spawnTime >= lifetimeSeconds)
         {
-            elapsed += Time.deltaTime;
-            if (elapsed >= lifetimeSeconds)
-            {
-                ReturnToPool("lifetime expired");
-            }
+            DoReturn(countAsThroughput: false);
         }
     }
 
-    /// <summary>
-    /// PathFollower가 경로 끝까지 도달했을 때 호출되는 콜백
-    /// </summary>
     private void HandlePathFinished()
     {
-        // 경로 끝 도착 → 회수
-        ForceReturn("path finished");
+        // 경로 끝까지 간 경우만 생산량(throughput)으로 카운트
+        DoReturn(countAsThroughput: true);
     }
 
-    /// <summary>
-    /// 외부에서 강제로 회수하고 싶을 때 호출할 수 있는 함수
-    /// </summary>
-    public void ForceReturn(string reason = "forced")
+    private void DoReturn(bool countAsThroughput)
     {
-        ReturnToPool(reason);
-    }
+        if (!gameObject.activeInHierarchy)
+            return;
 
-    private void ReturnToPool(string reason)
-    {
-        if (isReturned) return;
-        isReturned = true;
+        // 🔹 여기서 전역 throughput 카운터 증가
+        if (countAsThroughput && FactoryEnvManager.Instance != null)
+        {
+            FactoryEnvManager.Instance.RegisterProductExit();
+        }
 
         if (pool != null)
         {
-            pool.Return(gameObject);   // 풀로 회수 (비활성 + 보관)
+            pool.Return(gameObject);
         }
         else
         {
-            // 풀이 없으면 안전하게 삭제
-            Destroy(gameObject);
+            gameObject.SetActive(false);
         }
     }
 }
