@@ -2,10 +2,12 @@ using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
-///  - 15개 터널 중 3개를 랜덤으로 골라 동시에 고장(FORCE FAIL) 시킨다.
-///  - 로봇이 3개 전부 수리할 때까지 기다린다.
-///  - 3개가 모두 수리되면 10초 대기 후 다시 3개 랜덤 고장.
-///  - 이걸 무한 반복.
+///  - 터널 고장 시나리오를 A/B/C 3종류로 운용한다.
+///    A: 3개 동시 고장, B: 2개 동시 고장, C: 1개 고장.
+///  - 한 "사이클" 안에서 A/B/C가 각각 cycleCountA / B / C 번씩 등장하도록 함.
+///    (예: 5,5,5 로 두면 3*5 + 2*5 + 1*5 = 30 step)
+///  - 각 시나리오 타입의 순서는 랜덤이지만, 개수는 정확히 맞춘다.
+///  - 한 시나리오에서 발생한 FAULT가 모두 수리되면 delayBetweenScenarios 후 다음 시나리오 시작.
 /// </summary>
 public class RandomFailureScenario : MonoBehaviour
 {
@@ -13,8 +15,12 @@ public class RandomFailureScenario : MonoBehaviour
     public FactoryEnvManager factoryEnv;   // 인스펙터에서 할당 (없으면 자동 탐색)
 
     [Header("Scenario Settings")]
-    [Tooltip("한 시나리오에서 동시에 고장낼 터널 개수")]
-    public int faultsPerScenario = 3;
+    [Tooltip("A: 3개 고장 시나리오가 한 사이클에서 몇 번 등장할지")]
+    public int cycleCountA = 5;   // A: 3 faults
+    [Tooltip("B: 2개 고장 시나리오가 한 사이클에서 몇 번 등장할지")]
+    public int cycleCountB = 5;   // B: 2 faults
+    [Tooltip("C: 1개 고장 시나리오가 한 사이클에서 몇 번 등장할지")]
+    public int cycleCountC = 5;   // C: 1 fault
 
     [Tooltip("모든 고장이 수리된 후 다음 시나리오까지 대기 시간 (초)")]
     public float delayBetweenScenarios = 10f;
@@ -28,7 +34,12 @@ public class RandomFailureScenario : MonoBehaviour
     private bool scenarioActive = false;
     private float nextScenarioStartTime = 0f;
 
-        void Start()
+    // 사이클(에피소드 비슷한 단위) 내에서 남은 A/B/C 개수
+    private int remainingA;
+    private int remainingB;
+    private int remainingC;
+
+    void Start()
     {
         if (factoryEnv == null)
         {
@@ -51,7 +62,6 @@ public class RandomFailureScenario : MonoBehaviour
                 {
                     // 시나리오 모드에서는 기존 items-based 확률 고장을 잠깐 꺼둔다
                     t.useItemFailure = false;
-
                     allTunnels.Add(t);
                 }
             }
@@ -63,6 +73,9 @@ public class RandomFailureScenario : MonoBehaviour
             enabled = false;
             return;
         }
+
+        // 첫 사이클 초기화
+        ResetCycleCounts();
 
         // 게임 시작하자마자 첫 시나리오 바로 시작
         StartNewScenario();
@@ -80,7 +93,7 @@ public class RandomFailureScenario : MonoBehaviour
             return;
         }
 
-        // 시나리오 진행 중이면 "3개가 모두 수리됐는지" 확인
+        // 시나리오 진행 중이면 "모든 고장이 수리됐는지" 확인
         bool allRepaired = true;
 
         foreach (var t in currentFaults)
@@ -103,20 +116,92 @@ public class RandomFailureScenario : MonoBehaviour
 
             if (debugLogs)
             {
-                Debug.Log($"[RandomFailureScenario] 모든 시나리오 고장 수리 완료 → {delayBetweenScenarios:F1}s 뒤 다음 시나리오 시작");
+                Debug.Log($"[RandomFailureScenario] 시나리오 고장 {currentFaults.Count}개 수리 완료 → {delayBetweenScenarios:F1}s 뒤 다음 시나리오 시작");
             }
         }
     }
 
+    /// <summary>
+    /// A/B/C 남은 개수가 모두 0이면 새 사이클로 초기화.
+    /// </summary>
+    private void ResetCycleCounts()
+    {
+        remainingA = cycleCountA;
+        remainingB = cycleCountB;
+        remainingC = cycleCountC;
+
+        if (debugLogs)
+        {
+            int totalScenarios = remainingA + remainingB + remainingC;
+            Debug.Log($"[RandomFailureScenario] 새 사이클 시작: A={remainingA}, B={remainingB}, C={remainingC}, 총 시나리오 수={totalScenarios}");
+        }
+    }
+
+    /// <summary>
+    /// 다음 시나리오에서 몇 개를 고장낼지(A/B/C 중 하나)를 결정한다.
+    /// - A/B/C 중 아직 남아있는 타입들만 후보로 두고,
+    ///   그 중에서 랜덤으로 하나를 선택.
+    /// - 모든 타입의 remaining이 0이면 사이클 리셋 후 다시 선택.
+    /// </summary>
+    private int DecideFaultCountForNextScenario()
+    {
+        if (remainingA <= 0 && remainingB <= 0 && remainingC <= 0)
+        {
+            // 한 사이클을 다 썼으면 새 사이클로 리셋
+            ResetCycleCounts();
+        }
+
+        // 남아 있는 타입들만 후보로 모은다.
+        List<int> candidates = new List<int>(); // 3,2,1 을 담을 리스트
+
+        if (remainingA > 0) candidates.Add(3); // A
+        if (remainingB > 0) candidates.Add(2); // B
+        if (remainingC > 0) candidates.Add(1); // C
+
+        if (candidates.Count == 0)
+        {
+            // 이론상 올 수 없는 상황이지만 방어적으로 처리
+            Debug.LogWarning("[RandomFailureScenario] 남은 시나리오 타입이 없습니다. 기본값 1개 고장 사용.");
+            return 1;
+        }
+
+        int idx = Random.Range(0, candidates.Count);
+        int faultsThisScenario = candidates[idx];
+
+        // 선택된 타입에 따라 remaining 감소
+        if (faultsThisScenario == 3)
+        {
+            remainingA--;
+        }
+        else if (faultsThisScenario == 2)
+        {
+            remainingB--;
+        }
+        else if (faultsThisScenario == 1)
+        {
+            remainingC--;
+        }
+
+        if (debugLogs)
+        {
+            Debug.Log($"[RandomFailureScenario] 다음 시나리오 타입 선택: faults={faultsThisScenario}, 남은 A/B/C={remainingA}/{remainingB}/{remainingC}");
+        }
+
+        return faultsThisScenario;
+    }
+
     void StartNewScenario()
     {
+        // 이전 시나리오 정보 리셋
+        currentFaults.Clear();
+
+        // 이번 시나리오에서 몇 개를 고장낼지 결정 (A/B/C 중 하나)
+        int faultsPerScenario = DecideFaultCountForNextScenario();
+
         if (allTunnels.Count < faultsPerScenario)
         {
             Debug.LogWarning("[RandomFailureScenario] faultsPerScenario가 터널 개수보다 많습니다. 가능한 만큼만 사용합니다.");
         }
-
-        // 이전 시나리오 정보 리셋
-        currentFaults.Clear();
 
         // 랜덤으로 섞기 (Fisher-Yates)
         List<TunnelController> shuffled = new List<TunnelController>(allTunnels);
@@ -160,7 +245,7 @@ public class RandomFailureScenario : MonoBehaviour
 
         if (debugLogs)
         {
-            Debug.Log($"[RandomFailureScenario] 새 시나리오 시작: 고장 터널 {currentFaults.Count}개");
+            Debug.Log($"[RandomFailureScenario] 새 시나리오 시작: 고장 터널 {currentFaults.Count}개 (이번 타입 faultsPerScenario={faultsPerScenario})");
         }
     }
 }
