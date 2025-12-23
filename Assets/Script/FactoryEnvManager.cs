@@ -14,11 +14,16 @@ using UnityEngine;
 /// </summary>
 public class FactoryEnvManager : MonoBehaviour
 {
+
+    [Header("Simulation Speed Control")]
+[Tooltip("시뮬레이션 시간 배속 (1 = 실시간)")]
+public float simulationTimeScale = 1f;
+
     // ==== Singleton (편의용) ====
     public static FactoryEnvManager Instance { get; private set; }
     [Header("Debug / PL Logs")]
-[Tooltip("관찰 윈도우가 끝날 때 PL(T) 값을 로그로 출력할지 여부")]
-public bool debugLogWindowPl = true;
+    [Tooltip("관찰 윈도우가 끝날 때 PL(T) 값을 로그로 출력할지 여부")]
+    public bool debugLogWindowPl = true;
 
     [Header("Scene References (비워두면 자동 찾기)")]
     public ProductSpawner[] spawners;
@@ -69,7 +74,7 @@ public bool debugLogWindowPl = true;
     //   - EC, RO : 지금은 0 (나중에 로봇 이동량/수리 횟수와 연결 가능)
     //
     [Header("RL Reward (Global, Next-week Formula / Test)")]
-    [Tooltip("R_total = w1*PL~ - w2*QD~ - w3*FT~ - w4*BT~ - w5*EC~ - w6*RO~ 을 주기적으로 로그 출력할지 여부")]
+    [Tooltip("R_total을 주기적으로 로그 출력할지 여부")]
     public bool debugLogGlobalReward = true;
 
     [Tooltip("글로벌 리워드 로그 주기(초, 즉시형 인스턴트 리워드)")]
@@ -81,13 +86,10 @@ public bool debugLogWindowPl = true;
     [Tooltip("생산량 PL~의 가중치 (좋은 항, +)")]
     public float w1_PL = 1f;
 
-    [Tooltip("큐 길이 QD~의 가중치 (나쁜 항, -)")]
+    [Tooltip("큐 변화량 |QD(st+1)-QD(st)| 의 가중치 (좋은 항, +)")]
     public float w2_QD = 1f;
 
-    [Tooltip("고장 FT~의 가중치 (나쁜 항, -)")]
-    public float w3_FT = 1f;
-
-    [Tooltip("블로킹 BT~의 가중치 (나쁜 항, -)")]
+    [Tooltip("블로킹 변화량 |BT(st+1)-BT(st)| 의 가중치 (좋은 항, +)")]
     public float w4_BT = 1f;
 
     [Tooltip("에너지 EC~의 가중치 (나쁜 항, -)")]
@@ -100,13 +102,10 @@ public bool debugLogWindowPl = true;
     [Tooltip("PL 정규화용 최대값 (예: 시간 T 동안 가능한 최대 생산량)")]
     public float maxPL = 1f;
 
-    [Tooltip("QD 정규화용 최대값 (예: 모든 큐가 풀로 찬 상태의 합)")]
+    [Tooltip("QD 변화량 정규화용 최대값 (예: |QD(st+1)-QD(st)|의 최댓값 가정)")]
     public float maxQD = 10f;
 
-    [Tooltip("FT 정규화용 최대값 (예: 터널 수 또는 시간 누적 등)")]
-    public float maxFT = 5f;
-
-    [Tooltip("BT 정규화용 최대값 (예: 최악 블로킹 상태 기준)")]
+    [Tooltip("BT 변화량 정규화용 최대값 (예: |BT(st+1)-BT(st)|의 최댓값 가정)")]
     public float maxBT = 5f;
 
     [Tooltip("EC 정규화용 최대값 (에너지)")]
@@ -126,6 +125,11 @@ public bool debugLogWindowPl = true;
     private int _exitCountAtObsStart = 0;       // 관찰 윈도우 시작 시점의 값
     // 🔹 instant PL 계산용: 지난 instant 로그 시점의 값
     private int _prevGlobalExitCountInstant = 0;
+
+    // 🔹 instant QD/BT 변화량 계산용: 지난 instant 로그 시점의 스냅샷
+    private int _prevTotalQDInstant = 0;
+    private int _prevTotalBTInstant = 0;
+
     /// <summary>
     /// Product가 경로를 끝까지 따라간 뒤 풀로 리턴될 때 호출되는 전역 카운터
     /// </summary>
@@ -145,7 +149,11 @@ public bool debugLogWindowPl = true;
     bool _isObserving = false;
     float _obsEndTime;
 
-    // 시간 평균을 위한 누적값
+    // (추가) s_t 스냅샷 값 저장
+    private int _qdAtObsStart = 0;   // QD(s_t) = 전체 큐의 합
+    private int _btAtObsStart = 0;   // BT(s_t) = HOLD/HALF_HOLD 노드 수
+
+    // 시간 평균을 위한 누적값 (기존 필드 유지)
     float _sumQD, _sumFT, _sumBT, _sumEC, _sumRO;
     int _sampleCount;
 
@@ -214,6 +222,17 @@ public bool debugLogWindowPl = true;
 
         _nextCompactLogTime = Time.time + debugCompactInterval;
         _nextGlobalRewardLogTime = Time.time + globalRewardLogInterval;
+        ApplyTimeScale();
+    }
+    
+    void ApplyTimeScale()
+    {
+        Time.timeScale = simulationTimeScale;
+        Time.fixedDeltaTime = 0.02f * Time.timeScale;
+
+        Debug.Log(
+            $"[TimeScale] timeScale={Time.timeScale}, fixedDeltaTime={Time.fixedDeltaTime}"
+        );
     }
 
     void Update()
@@ -242,23 +261,33 @@ public bool debugLogWindowPl = true;
         // === PDF 수식 기반 "즉시형" 글로벌 리워드 로그 (선택) ===
         if (debugLogGlobalReward && Time.time >= _nextGlobalRewardLogTime)
         {
-            float plT, qdT, ftT, btT, ecT, roT;
-            float plN, qdN, ftN, btN, ecN, roN;
+            float plT, qdT, btT, ecT, roT;
+            float plN, qdN, btN, ecN, roN;
 
             float r = ComputeGlobalReward(
-                out plT, out qdT, out ftT, out btT, out ecT, out roT,
-                out plN, out qdN, out ftN, out btN, out ecN, out roN
+                out plT, out qdT, out btT, out ecT, out roT,
+                out plN, out qdN, out btN, out ecN, out roN
             );
 
             _lastGlobalReward = r;
             // 🔹 관찰 윈도우 기준 PL(T), PL~ 저장
             _lastWindowPlT = plT;
             _lastWindowPlNorm = plN;
+            float termPL = + w1_PL * plN;
+            float termQD = + w2_QD * qdN;
+            float termBT = + w4_BT * btN;
+            float termEC = - w5_EC * ecN;
+            float termRO = - w6_RO * roN;
+
             Debug.Log(
-                $"[FactoryReward(instant)] R_total={r:F3} " +
-                $"(PL={plT:F2}, QD={qdT:F2}, FT={ftT}, BT={btT}, EC={ecT:F2}, RO={roT:F2} | " +
-                $"PL~={plN:F2}, QD~={qdN:F2}, FT~={ftN:F2}, BT~={btN:F2}, EC~={ecN:F2}, RO~={roN:F2})"
+                $"[FactoryReward(instant)] R={r:F3} = " +
+                $"{termPL:F3}(PL) + {termQD:F3}(dQD) + {termBT:F3}(dBT) + {termEC:F3}(EC) + {termRO:F3}(RO)\n" +
+                $"  raw:   PL={plT:F0}, dQD=|Δ|={qdT:F0}, dBT=|Δ|={btT:F0}, EC={ecT:F2}, RO={roT:F2}\n" +
+                $"  norm:  PL~={plN:F3}, dQD~={qdN:F3}, dBT~={btN:F3}, EC~={ecN:F3}, RO~={roN:F3}\n" +
+                $"  w:     w1={w1_PL:F2}, w2={w2_QD:F2}, w4={w4_BT:F2}, w5={w5_EC:F2}, w6={w6_RO:F2}"
             );
+
+
 
             _nextGlobalRewardLogTime = Time.time + Mathf.Max(0.1f, globalRewardLogInterval);
         }
@@ -285,7 +314,26 @@ public bool debugLogWindowPl = true;
 
         // 🔸 관찰 시작 시점의 전역 throughput 카운트 저장
         _exitCountAtObsStart = _globalExitCount;
-        
+
+        // 🔸 s_t 시점 스냅샷(QD, BT) 저장
+        int startQD = 0;
+        int startBT = 0;
+        if (tunnels != null)
+        {
+            foreach (var t in tunnels)
+            {
+                if (t == null) continue;
+
+                if (t.queue != null)
+                    startQD += t.queue.Count;
+
+                if (t.IsHold || t.IsHalfHold)
+                    startBT++;
+            }
+        }
+        _qdAtObsStart = startQD;
+        _btAtObsStart = startBT;
+
         if (tunnels != null)
         {
             foreach (var t in tunnels)
@@ -332,11 +380,11 @@ public bool debugLogWindowPl = true;
         _sampleCount++;
     }
 
-        /// <summary>
-        /// 관찰 윈도우가 끝났을 때 호출.
-        /// 평균 QD/FT/BT와 sink throughput delta로 PL(T)을 계산하고,
-        /// 글로벌 리워드를 한 번 로그로 출력한다.
-        /// </summary>
+    /// <summary>
+    /// 관찰 윈도우가 끝났을 때 호출.
+    /// 평균 QD/FT/BT와 sink throughput delta로 PL(T)을 계산하고,
+    /// 글로벌 리워드를 한 번 로그로 출력한다.
+    /// </summary>
     void FinishObservationAndComputeReward()
     {
         _isObserving = false;
@@ -344,7 +392,7 @@ public bool debugLogWindowPl = true;
         if (_sampleCount <= 0)
             return;
 
-        // 관찰 윈도우 동안의 시간 평균
+        // 관찰 윈도우 동안의 시간 평균 (기존 로그/유지 목적)
         float avgQD = _sumQD / _sampleCount;
         float avgFT = _sumFT / _sampleCount;
         float avgBT = _sumBT / _sampleCount;
@@ -355,31 +403,54 @@ public bool debugLogWindowPl = true;
         int deltaExit = Mathf.Max(0, _globalExitCount - _exitCountAtObsStart);
         float plT = deltaExit;
 
-        float plN, qdN, ftN, btN, ecN, roN;
+        // 🔸 s_{t+1} 시점(관찰 종료 시점) 스냅샷(QD, BT)
+        int endQD = 0;
+        int endBT = 0;
+        if (tunnels != null)
+        {
+            foreach (var t in tunnels)
+            {
+                if (t == null) continue;
+
+                if (t.queue != null)
+                    endQD += t.queue.Count;
+
+                if (t.IsHold || t.IsHalfHold)
+                    endBT++;
+            }
+        }
+
+        // ✅ 새 정의: QD, BT는 "절대값 변화량"
+        float qdDeltaAbs = Mathf.Abs(endQD - _qdAtObsStart);
+        float btDeltaAbs = Mathf.Abs(endBT - _btAtObsStart);
+
+        float plN, qdN, btN, ecN, roN;
         float r = ComputeGlobalRewardFromValues(
-            plT, avgQD, avgFT, avgBT, ecT, roT,
-            out plN, out qdN, out ftN, out btN, out ecN, out roN
+            plT, qdDeltaAbs, btDeltaAbs, ecT, roT,
+            out plN, out qdN, out btN, out ecN, out roN
         );
 
         _lastGlobalReward = r;
         if (debugLogWindowPl)
         {
             Debug.Log(
-                $"[FactoryReward/PL] window={observationWindow:F1}s, " +
-                $"PL(T)={plT}, PL_norm={plN:F3}, " +
-                $"QD_avg={avgQD:F2}, FT_avg={avgFT:F2}, BT_avg={avgBT:F2}"
+                $"[FactoryReward(window-metrics)] T={observationWindow:F1}s\n" +
+                $"  PL: exitCount { _exitCountAtObsStart } -> { _globalExitCount }  => PL(T)={plT:F0}\n" +
+                $"  QD: totalQ  {_qdAtObsStart} -> {endQD}  => dQD=|Δ|={qdDeltaAbs:F0}\n" +
+                $"  BT: blocked {_btAtObsStart} -> {endBT}  => dBT=|Δ|={btDeltaAbs:F0}\n" +
+                $"  (avg for reference) QD_avg={avgQD:F2}, BT_avg={avgBT:F2}"
             );
+
         }
         if (debugLogGlobalReward)
         {
             Debug.Log(
                 $"[FactoryReward(window)] R={r:F3} | " +
-                $"PL(T)={plT:F2}, QD_avg={avgQD:F2}, FT_avg={avgFT:F2}, BT_avg={avgBT:F2} | " +
-                $"PL~={plN:F2}, QD~={qdN:F2}, FT~={ftN:F2}, BT~={btN:F2}, EC~={ecN:F2}, RO~={roN:F2}"
+                $"PL(T)={plT:F2}, dQD={qdDeltaAbs:F2}, dBT={btDeltaAbs:F2} | " +
+                $"PL~={plN:F2}, dQD~={qdN:F2}, dBT~={btN:F2}, EC~={ecN:F2}, RO~={roN:F2}"
             );
         }
     }
-
 
     // ===================== 노드 인덱스 =====================
 
@@ -640,44 +711,49 @@ public bool debugLogWindowPl = true;
         return best;
     }
 
-    // ----- 글로벌 리워드 계산 (PDF 수식 버전, 단순화) -----
+    // ----- 글로벌 리워드 계산 (수정된 버전: FT 제거, QD/BT는 변화량 |Δ| 보상) -----
 
     /// <summary>
-    /// 현재 상태에서 PL(T), QD(T), FT(T), BT(T), EC(T), RO(T)를
+    /// 현재 상태에서 PL(T), QD(T), BT(T), EC(T), RO(T)를
     /// 단순하게 추정한다.
     /// </summary>
-        void ComputeRawMetrics(
+    void ComputeRawMetrics(
         out float PL, out float QD,
-        out float FT, out float BT,
+        out float BT,
         out float EC, out float RO)
     {
         // 0으로 초기화
         PL = 0f;
         QD = 0f;
-        FT = 0f;
         BT = 0f;
         EC = 0f;
         RO = 0f;
 
-        // 1) QD / FT / BT : 전체 터널 스냅샷 기준
+        // 1) QD / BT : 전체 터널 스냅샷 기준 (현재값)
+        int currentQD = 0;
+        int currentBT = 0;
+
         foreach (var kv in nodes)
         {
             var n = kv.Value;
             if (n.isSpawner) continue;
 
-            QD += n.queueCount;
+            currentQD += n.queueCount;
 
             switch (n.tunnelState)
             {
-                case TunnelController.TunnelState.FAULT:
-                    FT += 1f;
-                    break;
                 case TunnelController.TunnelState.HOLD:
                 case TunnelController.TunnelState.HALF_HOLD:
-                    BT += 1f;
+                    currentBT += 1;
                     break;
             }
         }
+
+        // ✅ 새 정의(즉시형): s_t(이전 로그 시점) 대비 s_{t+1}(현재) 변화량의 절대값
+        QD = Mathf.Abs(currentQD - _prevTotalQDInstant);
+        BT = Mathf.Abs(currentBT - _prevTotalBTInstant);
+        _prevTotalQDInstant = currentQD;
+        _prevTotalBTInstant = currentBT;
 
         // 2) PL : 지난 instant 로그 이후 끝까지 간 제품 수 (전역 카운터 delta)
         int deltaExit = _globalExitCount - _prevGlobalExitCountInstant;
@@ -691,31 +767,28 @@ public bool debugLogWindowPl = true;
         // EC, RO는 나중에 로봇 이동/수리 횟수 붙이고 싶을 때 채우면 됨.
     }
 
-
     /// <summary>
-    /// 주어진 PL/QD/FT/BT/EC/RO 값으로부터
-    /// 정규화된 항들을 계산하고, 
-    /// R_total = w1*PL~ - w2*QD~ - ... 수식을 적용한다.
+    /// 주어진 PL/QD/BT/EC/RO 값으로부터
+    /// 정규화된 항들을 계산하고,
+    /// R_total = + w1*PL~ + w2*QD~ + w4*BT~ - w5*EC~ - w6*RO~
     /// (관찰 윈도우 / 즉시형 모두 공용으로 사용)
     /// </summary>
     public float ComputeGlobalRewardFromValues(
-        float PL, float QD, float FT, float BT, float EC, float RO,
+        float PL, float QD, float BT, float EC, float RO,
         out float PL_norm, out float QD_norm,
-        out float FT_norm, out float BT_norm,
+        out float BT_norm,
         out float EC_norm, out float RO_norm)
     {
         PL_norm = (maxPL > 0f) ? Mathf.Clamp01(PL / maxPL) : 0f;
         QD_norm = (maxQD > 0f) ? Mathf.Clamp01(QD / maxQD) : 0f;
-        FT_norm = (maxFT > 0f) ? Mathf.Clamp01(FT / maxFT) : 0f;
         BT_norm = (maxBT > 0f) ? Mathf.Clamp01(BT / maxBT) : 0f;
         EC_norm = (maxEC > 0f) ? Mathf.Clamp01(EC / maxEC) : 0f;
         RO_norm = (maxRO > 0f) ? Mathf.Clamp01(RO / maxRO) : 0f;
 
         float reward =
             + w1_PL * PL_norm
-            - w2_QD * QD_norm
-            - w3_FT * FT_norm
-            - w4_BT * BT_norm
+            + w2_QD * QD_norm
+            + w4_BT * BT_norm
             - w5_EC * EC_norm
             - w6_RO * RO_norm;
 
@@ -728,17 +801,17 @@ public bool debugLogWindowPl = true;
     /// </summary>
     public float ComputeGlobalReward(
         out float PL, out float QD,
-        out float FT, out float BT,
+        out float BT,
         out float EC, out float RO,
         out float PL_norm, out float QD_norm,
-        out float FT_norm, out float BT_norm,
+        out float BT_norm,
         out float EC_norm, out float RO_norm)
     {
-        ComputeRawMetrics(out PL, out QD, out FT, out BT, out EC, out RO);
+        ComputeRawMetrics(out PL, out QD, out BT, out EC, out RO);
         return ComputeGlobalRewardFromValues(
-            PL, QD, FT, BT, EC, RO,
+            PL, QD, BT, EC, RO,
             out PL_norm, out QD_norm,
-            out FT_norm, out BT_norm,
+            out BT_norm,
             out EC_norm, out RO_norm
         );
     }
@@ -751,7 +824,7 @@ public bool debugLogWindowPl = true;
     {
         return _lastGlobalReward;
     }
-        /// <summary>
+    /// <summary>
     /// 최근 관찰 윈도우의 PL(T) 원값
     /// </summary>
     public float GetLastWindowPl()
@@ -835,10 +908,10 @@ public bool debugLogWindowPl = true;
     {
         switch (s)
         {
-            case TunnelController.TunnelState.RUN:       return 0;
+            case TunnelController.TunnelState.RUN: return 0;
             case TunnelController.TunnelState.HALF_HOLD: return 1;
-            case TunnelController.TunnelState.HOLD:      return 2;
-            case TunnelController.TunnelState.FAULT:     return 3;
+            case TunnelController.TunnelState.HOLD: return 2;
+            case TunnelController.TunnelState.FAULT: return 3;
         }
         return -1;
     }

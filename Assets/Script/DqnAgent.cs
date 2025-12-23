@@ -599,23 +599,25 @@ public class DqnAgent : MonoBehaviour
     /// "지금 이 순간"의 글로벌 리워드 계산.
     /// (윈도우 기능을 끈 경우 fallback 용도로만 사용)
     /// </summary>
-    float GetInstantReward()
+float GetInstantReward()
+{
+    // FT 제거: 이제 PL, QD, BT, EC, RO만 받는다고 가정
+    float PL, QD, BT, EC, RO;
+    float PLn, QDn, BTn, ECn, ROn;
+
+    float r = factoryEnv.ComputeGlobalReward(
+        out PL, out QD, out BT, out EC, out RO,
+        out PLn, out QDn, out BTn, out ECn, out ROn
+    );
+
+    if (debugLogs)
     {
-        float PL, QD, FT, BT, EC, RO;
-        float PLn, QDn, FTn, BTn, ECn, ROn;
-
-        float r = factoryEnv.ComputeGlobalReward(
-            out PL, out QD, out FT, out BT, out EC, out RO,
-            out PLn, out QDn, out FTn, out BTn, out ECn, out ROn
-        );
-
-        if (debugLogs)
-        {
-            Debug.Log($"[DqnAgent] Instant Reward={r:F3} (PL={PL:F1}, QD={QD:F1}, FT={FT}, BT={BT})");
-        }
-
-        return r;
+        Debug.Log($"[DqnAgent] Instant Reward={r:F3} (PL={PL:F1}, QD={QD:F1}, BT={BT:F1})");
     }
+
+    return r;
+}
+
 
     // =========================
     //      Debug Helper들
