@@ -43,7 +43,7 @@ wandb.define_metric("buffer/*", step_metric="episode")
 # 체크포인트 설정
 CHECKPOINT_DIR = "./checkpoints"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-CHECKPOINT_INTERVAL = 5000  # step마다 저장 간격
+CHECKPOINT_INTERVAL = 500  # step마다 저장 간격
 
 
 # ==============================
@@ -99,12 +99,11 @@ class QNetwork(nn.Module):
            action(node_id): (B, 1)  -> 정규화된 float 로 넣음
     - 출력: Q(s, a): (B, 1)
     """
-
     def __init__(self, state_dim: int):
         super().__init__()
         self.state_dim = state_dim
 
-        input_dim = state_dim + 1  # state + (정규화된 node_id)
+        input_dim = state_dim + 1
         hidden = 256
         hidden2 = 128
 
@@ -113,28 +112,24 @@ class QNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden, hidden2),
             nn.ReLU(),
-            nn.Linear(hidden2, 1),  # Q-value 하나
+            nn.Linear(hidden2, 1),
         )
 
     def forward(self, state, action_id):
-        """
-        state: (B, state_dim)
-        action_id: (B, 1)  (float)
-        """
         x = torch.cat([state, action_id], dim=1)
         q = self.net(x)
-        return q  # (B, 1)
+        return q
 
 
 # ==============================
-#  DQN Learner
+#  DQN Learner (Double DQN + Soft Target Update)
 # ==============================
 class DqnLearner:
     def __init__(
         self,
         state_dim: int,
         gamma: float = 0.99,
-        lr: float = 1e-3,
+        lr: float = 3e-4,
         batch_size: int = 64,
         capacity: int = 100_000,
         warmup: int = 1_000,
@@ -158,13 +153,12 @@ class DqnLearner:
         self.replay = ReplayBuffer(capacity, state_dim)
 
         self.train_step_count = 0
-        self.last_loss = None  # 최근 학습 loss 저장
+        self.last_loss = None
 
-        # 관측된 node_id set (max_a' Q 계산용)
         self.known_actions = set()
-
-        # node_id 정규화를 위한 스케일 (대충 큰 값으로 나눔)
         self.node_id_scale = 100.0
+
+        self.tau = 0.005
 
         print(f"[PY] DqnLearner 초기화: state_dim={state_dim}, device={self.device}")
 
@@ -172,70 +166,54 @@ class DqnLearner:
         return torch.as_tensor(arr, dtype=dtype, device=self.device)
 
     def _action_to_tensor(self, actions):
-        """
-        actions: np.ndarray or list of int, shape (B,)
-        -> (B, 1) float tensor, node_id / node_id_scale
-        """
         a = np.array(actions, dtype=np.float32) / self.node_id_scale
-        t = self._to_tensor(a, dtype=torch.float32).unsqueeze(-1)  # (B, 1)
+        t = self._to_tensor(a, dtype=torch.float32).unsqueeze(-1)
         return t
 
     def observe(self, s, a, r, s_next, done=False):
-        """
-        transition 하나 관찰.
-        s, s_next: np.ndarray (state_dim,)
-        a: node_id
-        r: reward
-        done: 에피소드 종료 여부
-        return: train이 일어난 경우 loss(float), 아니면 None
-        """
         self.replay.push(s, a, r, s_next, done)
         self.known_actions.add(int(a))
 
         loss_val = None
         if len(self.replay) >= self.warmup:
             loss_val = self._train_step()
-
         return loss_val
 
     def _train_step(self):
         batch = self.replay.sample(self.batch_size)
 
-        states = self._to_tensor(batch["states"])           # (B, state_dim)
-        actions = batch["actions"]                          # (B,)
-        rewards = self._to_tensor(batch["rewards"])         # (B,)
-        next_states = self._to_tensor(batch["next_states"]) # (B, state_dim)
-        dones = self._to_tensor(batch["dones"])             # (B,)
+        states = self._to_tensor(batch["states"])
+        actions = batch["actions"]
+        rewards = self._to_tensor(batch["rewards"])
+        next_states = self._to_tensor(batch["next_states"])
+        dones = self._to_tensor(batch["dones"])
 
-        actions_t = self._action_to_tensor(actions)         # (B, 1)
+        actions_t = self._action_to_tensor(actions)
 
-        # Q(s, a)
-        q_values = self.policy_net(states, actions_t).squeeze(-1)  # (B,)
+        q_values = self.policy_net(states, actions_t).squeeze(-1)
 
-        # max_a' Q_target(s', a')
         if len(self.known_actions) == 0:
             max_next_q = torch.zeros_like(rewards)
         else:
-            # 모든 known_actions에 대해 s'마다 Q(s', a')를 계산 후 max
             action_list = sorted(self.known_actions)
             A = len(action_list)
             B = next_states.shape[0]
 
             actions_all = np.array(action_list, dtype=np.float32) / self.node_id_scale
-            actions_all_t = self._to_tensor(actions_all).view(1, A).repeat(B, 1)  # (B, A)
-            # (B, A, 1)
+            actions_all_t = self._to_tensor(actions_all)
+            actions_all_t = actions_all_t.view(1, A).repeat(B, 1)
             actions_all_t = actions_all_t.unsqueeze(-1).view(B * A, 1)
 
-            # states 반복
             states_rep = next_states.unsqueeze(1).expand(B, A, self.state_dim)
             states_rep = states_rep.reshape(B * A, self.state_dim)
 
             with torch.no_grad():
-                q_all = self.target_net(states_rep, actions_all_t)  # (B*A, 1)
-                q_all = q_all.view(B, A)  # (B, A)
-                max_next_q, _ = q_all.max(dim=1)  # (B,)
+                q_all_policy = self.policy_net(states_rep, actions_all_t).view(B, A)
+                best_idx = q_all_policy.argmax(dim=1)
 
-        # target = r + gamma * (1-done) * max_next_q
+                q_all_target = self.target_net(states_rep, actions_all_t).view(B, A)
+                max_next_q = q_all_target.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+
         targets = rewards + self.gamma * (1.0 - dones) * max_next_q
 
         loss = nn.MSELoss()(q_values, targets)
@@ -248,20 +226,17 @@ class DqnLearner:
         self.train_step_count += 1
         self.last_loss = float(loss.item())
 
-        if self.train_step_count % self.target_update_interval == 0:
-            self.target_net.load_state_dict(self.policy_net.state_dict())
-            print(f"[PY] target_net 업데이트 (train_step={self.train_step_count})")
+        with torch.no_grad():
+            tau = self.tau
+            for target_param, param in zip(self.target_net.parameters(),
+                                           self.policy_net.parameters()):
+                target_param.data.mul_(1.0 - tau).add_(tau * param.data)
 
-        # (원래 500 step마다 loss 출력하던 부분은 wandb로 대체 가능)
         return self.last_loss
 
     def predict_q(self, s, a) -> float:
-        """
-        단일 (s, a)에 대해 policy_net Q(s,a) 추론.
-        """
-        s_t = self._to_tensor(s).unsqueeze(0)            # (1, state_dim)
-        a_t = self._action_to_tensor([a])                # (1, 1)
-
+        s_t = self._to_tensor(s).unsqueeze(0)
+        a_t = self._action_to_tensor([a])
         with torch.no_grad():
             q = self.policy_net(s_t, a_t).item()
         return float(q)
@@ -281,21 +256,57 @@ class DqnLearner:
 
 
 # ==============================
+#  epsilon schedule (episode-based)
+# ==============================
+def epsilon_by_episode(
+    episode_idx: int,
+    eps_start: float = 1.0,
+    eps_min: float = 0.1,
+    decay_episodes: int = 1000,
+) -> float:
+    """
+    episode 1 -> eps_start
+    episode decay_episodes -> eps_min (선형 감소)
+    episode >= decay_episodes -> eps_min 유지
+    """
+    if episode_idx <= 1:
+        return eps_start
+    if episode_idx >= decay_episodes:
+        return eps_min
+
+    # 1..1000 구간에서 선형감소
+    t = (episode_idx - 1) / float(decay_episodes - 1)  # 0..1
+    eps = eps_start + t * (eps_min - eps_start)
+    return max(eps_min, float(eps))
+
+
+# ==============================
 #  TCP 서버 + 학습 루프
 # ==============================
 def main():
     step_count = 0
     state_dim = None
-    learner = None  # DqnLearner 인스턴스
+    learner = None
 
     # ---- 에피소드 관리용 변수 ----
-    episode_idx = 1          # 몇 번째 에피소드인지 (1부터 시작)
-    episode_step = 0         # 현재 에피소드 안에서 몇 스텝째인지
-    episode_return = 0.0     # 에피소드 누적 reward
-    MAX_STEPS_PER_EPISODE = 100
+    episode_idx = 1
+    episode_step = 0
+    episode_return = 0.0
 
-    # 최근 epsilon (Unity에서 msg로 넘어오는 값)
-    latest_epsilon = None
+    # ✅ 에피소드 기반 추가 통계
+    episode_q_sum = 0.0
+    episode_q_count = 0
+    episode_loss_sum = 0.0
+    episode_loss_count = 0
+    episode_random_count = 0
+
+    # 🔹 한 에피소드 = 30 step
+    MAX_STEPS_PER_EPISODE = 30
+
+    # 로깅용: Unity가 보내온 epsilon (참고)
+    latest_base_epsilon_unity = None
+    # 로깅용: 실제 사용 epsilon
+    latest_epsilon_used = None
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -335,8 +346,10 @@ def main():
                     if msg_type == "action_request":
                         state_list = msg.get("state", [])
                         cand_ids = msg.get("candidate_node_ids", [])
-                        epsilon = float(msg.get("epsilon", 0.1))
-                        latest_epsilon = epsilon  # transition 로그 때 사용
+
+                        # Unity에서 넘어온 epsilon (참고용)
+                        base_epsilon_unity = float(msg.get("epsilon", 0.1))
+                        latest_base_epsilon_unity = base_epsilon_unity
 
                         if len(state_list) == 0 or len(cand_ids) == 0:
                             print("[PY] action_request: 빈 state 또는 candidate_node_ids")
@@ -352,7 +365,7 @@ def main():
                             learner = DqnLearner(
                                 state_dim=state_dim,
                                 gamma=0.99,
-                                lr=1e-3,
+                                lr=3e-4,
                                 batch_size=64,
                                 capacity=100_000,
                                 warmup=1_000,
@@ -361,7 +374,7 @@ def main():
 
                         cand_ids = [int(x) for x in cand_ids]
 
-                        # 후보들에 대한 Q(s, a) 추정
+                        # 후보들 Q(s,a)
                         q_values = []
                         for nid in cand_ids:
                             try:
@@ -370,7 +383,16 @@ def main():
                                 print(f"[PY] predict_q error for node_id={nid}: {e}")
                                 q_values.append(0.0)
 
-                        # ε-greedy 액션 선택
+                        # ✅ episode 기반 epsilon 사용
+                        epsilon = epsilon_by_episode(
+                            episode_idx=episode_idx,
+                            eps_start=1.0,
+                            eps_min=0.1,
+                            decay_episodes=2000,
+                        )
+                        latest_epsilon_used = epsilon
+
+                        # ε-greedy
                         rand_val = np.random.rand()
                         if rand_val < epsilon:
                             idx = np.random.randint(len(cand_ids))
@@ -379,6 +401,9 @@ def main():
                             idx = int(np.argmax(q_values))
                             is_random = False
 
+                        if is_random:
+                            episode_random_count += 1
+
                         chosen_node_id = int(cand_ids[idx])
 
                         reply = {
@@ -386,20 +411,27 @@ def main():
                             "chosen_node_id": chosen_node_id,
                             "candidate_node_ids": cand_ids,
                             "q_values": [float(q) for q in q_values],
-                            "epsilon": float(epsilon),
+                            "epsilon": float(epsilon),         # Unity로도 전달 (표시/디버그용)
                             "is_random": bool(is_random),
                         }
 
                         try:
                             conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
-                            print(
-                                f"[PY] action_reply: chosen={chosen_node_id}, "
-                                f"eps={epsilon:.3f}, random={is_random}"
-                            )
+                            if episode_step == 0:
+                                print(f"[PY] === Episode {episode_idx} 시작 === (epsilon={epsilon:.3f})")
+                            print(f"[PY] action_reply: chosen={chosen_node_id}, eps={epsilon:.3f}, random={is_random}")
                         except Exception as e:
                             print(f"[PY] action_reply send error: {e}")
 
-                        # 다음 메시지 처리
+                        # per-step로도 epsilon 로깅 (선택된 epsilon 확인용)
+                        wandb.log(
+                            {
+                                "env_step": step_count,
+                                "train/epsilon_used": float(latest_epsilon_used),
+                                "train/base_epsilon_unity": float(latest_base_epsilon_unity),
+                            }
+                        )
+
                         continue
 
                     # ==============================
@@ -407,7 +439,7 @@ def main():
                     # ==============================
                     if msg_type == "transition":
                         action_id = msg.get("action_id", -1)
-                        node_id = msg.get("node_id", -1)
+                        node_id = int(msg.get("node_id", -1))
                         reward = float(msg.get("reward", 0.0))
 
                         s_t = np.array(msg.get("state_t", []), dtype=np.float32)
@@ -417,44 +449,44 @@ def main():
                             state_dim = s_t.shape[0]
                             print(f"[PY] 첫 state 수신. state_dim={state_dim}")
 
-                        # DQN learner 초기화
                         if learner is None:
                             learner = DqnLearner(
                                 state_dim=state_dim,
                                 gamma=0.99,
-                                lr=1e-3,
+                                lr=3e-4,
                                 batch_size=64,
                                 capacity=100_000,
-                                warmup=1_000,  # 1000 스텝 모이면 학습 시작
+                                warmup=500,
                                 target_update_interval=1_000,
                             )
 
-                        # ---- 전역 step 카운터 증가 ----
+                        # ---- 전역 step ----
                         step_count += 1
 
-                        # ---- 에피소드 스텝/리턴 업데이트 ----
+                        # ---- episode step / return ----
                         episode_step += 1
                         episode_return += reward
 
-                        # 에피소드 처음 스텝이면 시작 로그
-                        if episode_step == 1:
-                            print(f"[PY] === Episode {episode_idx} 시작 ===")
-
-                        # ---- DQN에 transition 전달 ----
-                        done = False
-                        # 100 스텝마다 '가상의 에피소드' 종료 플래그
-                        if episode_step >= MAX_STEPS_PER_EPISODE:
-                            done = True
+                        done = (episode_step >= MAX_STEPS_PER_EPISODE)
 
                         loss_val = learner.observe(s_t, node_id, reward, s_tp1, done=done)
 
-                        # ---- 현재 (s_t, node_id)에 대한 Q(s,a) 예측해서 Unity로 q_update 전송 ----
+                        # q_est
                         try:
                             q_est = learner.predict_q(s_t, node_id)
                         except Exception as e:
                             print(f"[PY] predict_q error: {e}")
-                            q_est = reward  # fallback
+                            q_est = reward
 
+                        # episode 통계 집계
+                        episode_q_sum += float(q_est)
+                        episode_q_count += 1
+
+                        if loss_val is not None:
+                            episode_loss_sum += float(loss_val)
+                            episode_loss_count += 1
+
+                        # Unity로 q_update
                         q_msg = {
                             "type": "q_update",
                             "node_ids": [int(node_id)],
@@ -466,19 +498,17 @@ def main():
                             print(
                                 f"[PY] step={step_count} | episode={episode_idx} "
                                 f"step={episode_step}/{MAX_STEPS_PER_EPISODE} : "
-                                f"action_id={action_id}, node_id={node_id}, "
-                                f"reward={reward:+.3f}"
+                                f"action_id={action_id}, node_id={node_id}, reward={reward:+.3f}"
                             )
                         except Exception as e:
                             print(f"[PY] q_update send error: {e}")
 
-                        # 앞 몇 개 상태값만 샘플로 출력 (초기 몇 step)
                         if step_count <= 3:
                             head = 12
                             print(f"      s_t[0:{head}]   = {s_t[:head]}")
                             print(f"      s_tp1[0:{head}] = {s_tp1[:head]}")
 
-                        # ---- W&B per-step 로깅 ----
+                        # per-step W&B
                         wandb.log(
                             {
                                 "env_step": step_count,
@@ -486,27 +516,36 @@ def main():
                                 "train/q_est": float(q_est),
                                 "train/loss": float(loss_val) if loss_val is not None else 0.0,
                                 "train/done_flag": float(done),
-                                "train/epsilon": float(latest_epsilon) if latest_epsilon is not None else 0.0,
+                                "train/epsilon_used": float(latest_epsilon_used) if latest_epsilon_used is not None else 0.0,
+                                "train/base_epsilon_unity": float(latest_base_epsilon_unity) if latest_base_epsilon_unity is not None else 0.0,
                                 "buffer/size": len(learner.replay),
                             }
                         )
 
-                        # ---- 에피소드 종료 처리 ----
+                        # ---- episode 종료 처리 ----
                         if done:
                             avg_reward = episode_return / float(max(1, episode_step))
+                            avg_q = episode_q_sum / float(max(1, episode_q_count))
+                            avg_loss = (episode_loss_sum / float(episode_loss_count)) if episode_loss_count > 0 else 0.0
+                            random_rate = episode_random_count / float(MAX_STEPS_PER_EPISODE)
+
                             print(
                                 f"[PY] === Episode {episode_idx} done === "
-                                f"(episode_step={episode_step}, return={episode_return:+.3f}, "
-                                f"avg_reward={avg_reward:+.3f})"
+                                f"(len={episode_step}, return={episode_return:+.3f}, avg_reward={avg_reward:+.3f}, "
+                                f"avg_q={avg_q:+.3f}, avg_loss={avg_loss:.6f}, random_rate={random_rate:.2f})"
                             )
 
-                            # W&B per-episode 로깅
+                            # per-episode W&B
                             wandb.log(
                                 {
                                     "episode": episode_idx,
                                     "episodic/return": float(episode_return),
                                     "episodic/avg_reward": float(avg_reward),
-                                    "episodic/length": episode_step,
+                                    "episodic/length": int(episode_step),
+                                    "episodic/avg_q_est": float(avg_q),
+                                    "episodic/avg_loss": float(avg_loss),
+                                    "episodic/random_rate": float(random_rate),
+                                    "episodic/epsilon_used": float(latest_epsilon_used) if latest_epsilon_used is not None else 0.0,
                                     "buffer/size": len(learner.replay),
                                 }
                             )
@@ -515,15 +554,19 @@ def main():
                             episode_step = 0
                             episode_return = 0.0
 
+                            # episode 통계 리셋
+                            episode_q_sum = 0.0
+                            episode_q_count = 0
+                            episode_loss_sum = 0.0
+                            episode_loss_count = 0
+                            episode_random_count = 0
+
                         # ---- 체크포인트 저장 ----
                         if step_count % CHECKPOINT_INTERVAL == 0:
                             learner.save(step_count)
 
                         continue
 
-                    # ==============================
-                    # 3) 그 외 타입
-                    # ==============================
                     print(f"[PY] Unknown msg type: {msg_type}")
 
 
