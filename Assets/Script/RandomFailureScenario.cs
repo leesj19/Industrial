@@ -8,11 +8,11 @@ using UnityEngine;
 ///    (예: 5,5,5 로 두면 3*5 + 2*5 + 1*5 = 30 step)
 ///  - 각 시나리오 타입의 순서는 랜덤이지만, 개수는 정확히 맞춘다.
 ///  - 한 시나리오에서 발생한 FAULT가 모두 수리되면 delayBetweenScenarios 후 다음 시나리오 시작.
-/// 
-///  + (추가) Clean 시나리오 D:
+///
+///  + Clean 시나리오 D:
 ///    - 일반 시나리오가 cleanEveryNScenarios 번 끝날 때마다 다음은 Clean(D)
 ///    - Clean 동안: 고장 0개, 스폰 강제 정지, cleanDuration 동안 대기
-///    - 종료 후: 스폰 재개, delayBetweenScenarios 뒤 정상 시나리오 재개
+///    - 종료 후: 스폰 재개 + (추가) Clean 시작 전 스포너 상태 복원
 /// </summary>
 public class RandomFailureScenario : MonoBehaviour
 {
@@ -58,6 +58,10 @@ public class RandomFailureScenario : MonoBehaviour
     private bool cleanActive = false;
     private float cleanEndTime = 0f;
     private int scenariosCompletedSinceLastClean = 0;
+
+    // ✅ (추가) Clean 시작 전 스포너 상태 저장/복원용
+    private Dictionary<ProductSpawner, ProductSpawner.SpawnerState> spawnerStateBackup
+        = new Dictionary<ProductSpawner, ProductSpawner.SpawnerState>();
 
     void Start()
     {
@@ -182,28 +186,22 @@ public class RandomFailureScenario : MonoBehaviour
 
     /// <summary>
     /// 다음 시나리오에서 몇 개를 고장낼지(A/B/C 중 하나)를 결정한다.
-    /// - A/B/C 중 아직 남아있는 타입들만 후보로 두고,
-    ///   그 중에서 랜덤으로 하나를 선택.
-    /// - 모든 타입의 remaining이 0이면 사이클 리셋 후 다시 선택.
     /// </summary>
     private int DecideFaultCountForNextScenario()
     {
         if (remainingA <= 0 && remainingB <= 0 && remainingC <= 0)
         {
-            // 한 사이클을 다 썼으면 새 사이클로 리셋
             ResetCycleCounts();
         }
 
-        // 남아 있는 타입들만 후보로 모은다.
-        List<int> candidates = new List<int>(); // 3,2,1 을 담을 리스트
+        List<int> candidates = new List<int>();
 
-        if (remainingA > 0) candidates.Add(3); // A
-        if (remainingB > 0) candidates.Add(2); // B
-        if (remainingC > 0) candidates.Add(1); // C
+        if (remainingA > 0) candidates.Add(3);
+        if (remainingB > 0) candidates.Add(2);
+        if (remainingC > 0) candidates.Add(1);
 
         if (candidates.Count == 0)
         {
-            // 이론상 올 수 없는 상황이지만 방어적으로 처리
             Debug.LogWarning("[RandomFailureScenario] 남은 시나리오 타입이 없습니다. 기본값 1개 고장 사용.");
             return 1;
         }
@@ -211,19 +209,9 @@ public class RandomFailureScenario : MonoBehaviour
         int idx = Random.Range(0, candidates.Count);
         int faultsThisScenario = candidates[idx];
 
-        // 선택된 타입에 따라 remaining 감소
-        if (faultsThisScenario == 3)
-        {
-            remainingA--;
-        }
-        else if (faultsThisScenario == 2)
-        {
-            remainingB--;
-        }
-        else if (faultsThisScenario == 1)
-        {
-            remainingC--;
-        }
+        if (faultsThisScenario == 3) remainingA--;
+        else if (faultsThisScenario == 2) remainingB--;
+        else if (faultsThisScenario == 1) remainingC--;
 
         if (debugLogs)
         {
@@ -242,10 +230,8 @@ public class RandomFailureScenario : MonoBehaviour
             return;
         }
 
-        // 이전 시나리오 정보 리셋
         currentFaults.Clear();
 
-        // 이번 시나리오에서 몇 개를 고장낼지 결정 (A/B/C 중 하나)
         int faultsPerScenario = DecideFaultCountForNextScenario();
 
         if (allTunnels.Count < faultsPerScenario)
@@ -271,18 +257,14 @@ public class RandomFailureScenario : MonoBehaviour
             TunnelController t = shuffled[i];
             if (t == null) continue;
 
-            // 자동 수리 끄기 (이 시나리오 동안은 로봇만 수리하게)
             t.autoRepairFixedDelay = false;
 
-            // 이미 고장 상태면 한번 수리해두고 다시 고장낼 수도 있음
             if (t.IsFault)
             {
                 t.ForceRepair();
             }
 
-            // 이 터널을 고장 상태로 만들기
             t.ForceFail();
-
             currentFaults.Add(t);
 
             if (debugLogs)
@@ -307,6 +289,9 @@ public class RandomFailureScenario : MonoBehaviour
         scenarioActive = false;
         currentFaults.Clear();
 
+        // ✅ (추가) Clean 시작 전 스포너 상태 백업
+        BackupSpawnerStates();
+
         // 스폰 강제 정지
         SetSpawnersForceStop(true);
 
@@ -329,6 +314,9 @@ public class RandomFailureScenario : MonoBehaviour
         // 스폰 재개
         SetSpawnersForceStop(false);
 
+        // ✅ (추가) Clean 시작 전 상태로 복원 (HOLD로 남아버리는 문제 방지)
+        RestoreSpawnerStates();
+
         // 다음 정상 시나리오 예약
         nextScenarioStartTime = Time.time + delayBetweenScenarios;
 
@@ -348,5 +336,51 @@ public class RandomFailureScenario : MonoBehaviour
             if (sp == null) continue;
             sp.ForceStopSpawning(stop);
         }
+    }
+
+    // ✅ (추가) 스포너 상태 백업/복원
+    private void BackupSpawnerStates()
+    {
+        spawnerStateBackup.Clear();
+        if (spawners == null) return;
+
+        for (int i = 0; i < spawners.Count; i++)
+        {
+            var sp = spawners[i];
+            if (sp == null) continue;
+
+            ProductSpawner.SpawnerState st = ProductSpawner.SpawnerState.RUN;
+            if (sp.IsHold) st = ProductSpawner.SpawnerState.HOLD;
+            else if (sp.IsHalfHold) st = ProductSpawner.SpawnerState.HALF_HOLD;
+            else st = ProductSpawner.SpawnerState.RUN;
+
+            spawnerStateBackup[sp] = st;
+
+            if (debugLogs)
+            {
+                Debug.Log($"[RandomFailureScenario] (Backup) spawner={sp.name} state={st}");
+            }
+        }
+    }
+
+    private void RestoreSpawnerStates()
+    {
+        if (spawnerStateBackup == null || spawnerStateBackup.Count == 0) return;
+
+        foreach (var kv in spawnerStateBackup)
+        {
+            var sp = kv.Key;
+            if (sp == null) continue;
+
+            // ForceStop이 false인 상태에서만 의미 있음
+            sp.SetState(kv.Value);
+
+            if (debugLogs)
+            {
+                Debug.Log($"[RandomFailureScenario] (Restore) spawner={sp.name} state={kv.Value}");
+            }
+        }
+
+        spawnerStateBackup.Clear();
     }
 }
