@@ -24,6 +24,12 @@ public class ProductSpawner : MonoBehaviour
     public bool IsHalfHold => state == SpawnerState.HALF_HOLD;
     public bool IsHold     => state == SpawnerState.HOLD;
 
+    // ✅ (추가) Clean 등 외부 이유로 스폰을 "강제 정지"할 때 사용
+    [Header("Forced Stop (External Override)")]
+    [Tooltip("true이면 업스트림 신호와 무관하게 스폰을 완전히 멈춤 (Clean 시나리오용)")]
+    [SerializeField] private bool forceStopSpawning = false;
+    public bool ForceStopSpawningFlag => forceStopSpawning;
+
     // ====== Visual ======
     [Header("Status Visual")]
     [Tooltip("상태 색을 바꿀 Renderer (예: 상단 판 MeshRenderer)")]
@@ -66,6 +72,10 @@ public class ProductSpawner : MonoBehaviour
 
     private void Update()
     {
+        // ✅ 강제 스폰 정지(Clean 등)
+        if (forceStopSpawning)
+            return;
+
         // 자동 스폰: HOLD가 아닌 상태에서만 시도
         if (!autoStart || pool == null || path == null || IsHold)
             return;
@@ -88,6 +98,10 @@ public class ProductSpawner : MonoBehaviour
     /// </summary>
     public void SpawnOne()
     {
+        // ✅ 강제 스폰 정지(Clean 등)
+        if (forceStopSpawning)
+            return;
+
         // 완전 HOLD면 스폰 금지
         if (IsHold || pool == null || path == null)
             return;
@@ -111,10 +125,25 @@ public class ProductSpawner : MonoBehaviour
             ret.lifetimeSeconds = productLifetimeSeconds;
     }
 
-    // ====== External control (from upstream tunnel) ======
+    // ✅ (추가) 외부에서 스폰 강제 OFF/ON
+    public void ForceStopSpawning(bool stop)
+    {
+        forceStopSpawning = stop;
+        if (stop)
+        {
+            // Clean 들어갈 때는 안전하게 HOLD로 잠가두고 타이머도 리셋
+            state = SpawnerState.HOLD;
+            t = 0f;
+        }
+        ApplyStatusVisual();
+    }
 
+    // ====== External control (from upstream tunnel) ======
     public void SetState(SpawnerState newState)
     {
+        // ✅ Clean 등으로 강제 정지 중이면 업스트림 상태 변경 무시
+        if (forceStopSpawning) return;
+
         if (state == newState) return;
         state = newState;
         ApplyStatusVisual();
@@ -122,6 +151,7 @@ public class ProductSpawner : MonoBehaviour
 
     public void EnterHold()
     {
+        // forceStopSpawning 중이어도 HOLD는 문제없으니 허용
         if (state == SpawnerState.HOLD) return;
         state = SpawnerState.HOLD;
         ApplyStatusVisual();
@@ -129,6 +159,9 @@ public class ProductSpawner : MonoBehaviour
 
     public void EnterRun()
     {
+        // ✅ Clean 등으로 강제 정지 중이면 RUN 복귀 금지
+        if (forceStopSpawning) return;
+
         if (state == SpawnerState.RUN) return;
         state = SpawnerState.RUN;
         ApplyStatusVisual();
@@ -136,6 +169,9 @@ public class ProductSpawner : MonoBehaviour
 
     public void EnterHalfHold()
     {
+        // ✅ Clean 등으로 강제 정지 중이면 HALF_HOLD 복귀 금지
+        if (forceStopSpawning) return;
+
         if (state == SpawnerState.HALF_HOLD) return;
         state = SpawnerState.HALF_HOLD;
         ApplyStatusVisual();
@@ -153,11 +189,19 @@ public class ProductSpawner : MonoBehaviour
         var prop = string.IsNullOrEmpty(colorProperty) ? "_Color" : colorProperty;
         Color c = runColor;
 
-        switch (state)
+        // ✅ 강제 정지 중이면 시각적으로 HOLD로 고정
+        if (forceStopSpawning)
         {
-            case SpawnerState.RUN:       c = runColor;      break;
-            case SpawnerState.HALF_HOLD: c = halfHoldColor; break;
-            case SpawnerState.HOLD:      c = holdColor;     break;
+            c = holdColor;
+        }
+        else
+        {
+            switch (state)
+            {
+                case SpawnerState.RUN:       c = runColor;      break;
+                case SpawnerState.HALF_HOLD: c = halfHoldColor; break;
+                case SpawnerState.HOLD:      c = holdColor;     break;
+            }
         }
 
         if (instMat.HasProperty(prop))
@@ -168,11 +212,19 @@ public class ProductSpawner : MonoBehaviour
     private void OnDrawGizmos()
     {
         Color c = runColor;
-        switch (state)
+
+        if (forceStopSpawning)
         {
-            case SpawnerState.RUN:       c = runColor;      break;
-            case SpawnerState.HALF_HOLD: c = halfHoldColor; break;
-            case SpawnerState.HOLD:      c = holdColor;     break;
+            c = holdColor;
+        }
+        else
+        {
+            switch (state)
+            {
+                case SpawnerState.RUN:       c = runColor;      break;
+                case SpawnerState.HALF_HOLD: c = halfHoldColor; break;
+                case SpawnerState.HOLD:      c = holdColor;     break;
+            }
         }
 
         Gizmos.color = c;

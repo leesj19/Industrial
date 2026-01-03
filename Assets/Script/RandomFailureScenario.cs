@@ -8,6 +8,11 @@ using UnityEngine;
 ///    (예: 5,5,5 로 두면 3*5 + 2*5 + 1*5 = 30 step)
 ///  - 각 시나리오 타입의 순서는 랜덤이지만, 개수는 정확히 맞춘다.
 ///  - 한 시나리오에서 발생한 FAULT가 모두 수리되면 delayBetweenScenarios 후 다음 시나리오 시작.
+/// 
+///  + (추가) Clean 시나리오 D:
+///    - 일반 시나리오가 cleanEveryNScenarios 번 끝날 때마다 다음은 Clean(D)
+///    - Clean 동안: 고장 0개, 스폰 강제 정지, cleanDuration 동안 대기
+///    - 종료 후: 스폰 재개, delayBetweenScenarios 뒤 정상 시나리오 재개
 /// </summary>
 public class RandomFailureScenario : MonoBehaviour
 {
@@ -25,6 +30,16 @@ public class RandomFailureScenario : MonoBehaviour
     [Tooltip("모든 고장이 수리된 후 다음 시나리오까지 대기 시간 (초)")]
     public float delayBetweenScenarios = 10f;
 
+    [Header("Clean Scenario (D)")]
+    [Tooltip("일반 시나리오가 이 횟수만큼 끝나면 다음 시나리오는 Clean(D)로 실행 (예: 5면 1~5 후 6번째가 Clean)")]
+    public int cleanEveryNScenarios = 5;
+
+    [Tooltip("Clean(D) 지속 시간 (초)")]
+    public float cleanDuration = 30f;
+
+    [Tooltip("Clean(D) 동안 강제 스폰 정지/재개할 스포너 목록 (비워두면 씬에서 자동 탐색)")]
+    public List<ProductSpawner> spawners = new List<ProductSpawner>();
+
     [Header("Debug")]
     public bool debugLogs = true;
 
@@ -38,6 +53,11 @@ public class RandomFailureScenario : MonoBehaviour
     private int remainingA;
     private int remainingB;
     private int remainingC;
+
+    // Clean 관련 상태
+    private bool cleanActive = false;
+    private float cleanEndTime = 0f;
+    private int scenariosCompletedSinceLastClean = 0;
 
     void Start()
     {
@@ -74,6 +94,16 @@ public class RandomFailureScenario : MonoBehaviour
             return;
         }
 
+        // 스포너 자동 수집(인스펙터에서 비워둔 경우)
+        if (spawners == null || spawners.Count == 0)
+        {
+            spawners = new List<ProductSpawner>(FindObjectsOfType<ProductSpawner>());
+            if (debugLogs)
+            {
+                Debug.Log($"[RandomFailureScenario] spawners 자동 탐색: {spawners.Count}개");
+            }
+        }
+
         // 첫 사이클 초기화
         ResetCycleCounts();
 
@@ -83,6 +113,16 @@ public class RandomFailureScenario : MonoBehaviour
 
     void Update()
     {
+        // Clean(D) 진행 중이면 시간만 체크해서 종료 처리
+        if (cleanActive)
+        {
+            if (Time.time >= cleanEndTime)
+            {
+                EndCleanScenario();
+            }
+            return;
+        }
+
         if (!scenarioActive)
         {
             // 시나리오 사이 대기 중
@@ -114,9 +154,12 @@ public class RandomFailureScenario : MonoBehaviour
             scenarioActive = false;
             nextScenarioStartTime = Time.time + delayBetweenScenarios;
 
+            // ✅ 일반 시나리오 완료 카운트 증가 (Clean은 제외)
+            scenariosCompletedSinceLastClean++;
+
             if (debugLogs)
             {
-                Debug.Log($"[RandomFailureScenario] 시나리오 고장 {currentFaults.Count}개 수리 완료 → {delayBetweenScenarios:F1}s 뒤 다음 시나리오 시작");
+                Debug.Log($"[RandomFailureScenario] 시나리오 고장 {currentFaults.Count}개 수리 완료 → {delayBetweenScenarios:F1}s 뒤 다음 시나리오 시작 (sinceClean={scenariosCompletedSinceLastClean})");
             }
         }
     }
@@ -192,6 +235,13 @@ public class RandomFailureScenario : MonoBehaviour
 
     void StartNewScenario()
     {
+        // ✅ 일정 횟수마다 Clean(D) 실행
+        if (cleanEveryNScenarios > 0 && scenariosCompletedSinceLastClean >= cleanEveryNScenarios)
+        {
+            StartCleanScenario();
+            return;
+        }
+
         // 이전 시나리오 정보 리셋
         currentFaults.Clear();
 
@@ -246,6 +296,57 @@ public class RandomFailureScenario : MonoBehaviour
         if (debugLogs)
         {
             Debug.Log($"[RandomFailureScenario] 새 시나리오 시작: 고장 터널 {currentFaults.Count}개 (이번 타입 faultsPerScenario={faultsPerScenario})");
+        }
+    }
+
+    // ==============================
+    //  Clean(D)
+    // ==============================
+    private void StartCleanScenario()
+    {
+        scenarioActive = false;
+        currentFaults.Clear();
+
+        // 스폰 강제 정지
+        SetSpawnersForceStop(true);
+
+        cleanActive = true;
+        cleanEndTime = Time.time + cleanDuration;
+
+        if (debugLogs)
+        {
+            Debug.Log($"[RandomFailureScenario] === CLEAN(D) 시작 === duration={cleanDuration:F1}s | 고장 0개 | 스폰 OFF");
+        }
+
+        // 카운트 리셋
+        scenariosCompletedSinceLastClean = 0;
+    }
+
+    private void EndCleanScenario()
+    {
+        cleanActive = false;
+
+        // 스폰 재개
+        SetSpawnersForceStop(false);
+
+        // 다음 정상 시나리오 예약
+        nextScenarioStartTime = Time.time + delayBetweenScenarios;
+
+        if (debugLogs)
+        {
+            Debug.Log($"[RandomFailureScenario] === CLEAN(D) 종료 === → {delayBetweenScenarios:F1}s 뒤 정상 시나리오 재개");
+        }
+    }
+
+    private void SetSpawnersForceStop(bool stop)
+    {
+        if (spawners == null) return;
+
+        for (int i = 0; i < spawners.Count; i++)
+        {
+            var sp = spawners[i];
+            if (sp == null) continue;
+            sp.ForceStopSpawning(stop);
         }
     }
 }
